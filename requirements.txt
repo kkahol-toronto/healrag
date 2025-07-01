@@ -1,0 +1,26 @@
+# HEALRAG - Azure RAG Library Dependencies
+
+# Azure Storage
+azure-storage-blob
+azure-core
+
+# MarkItDown for document processing
+markitdown[all]
+
+# Image extraction and processing
+PyMuPDF>=1.23.0  # For PDF image extraction
+python-docx>=0.8.11  # For Word document image extraction
+Pillow>=10.0.0  # For image processing
+
+# Azure OpenAI
+openai>=1.0.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# Additional dependencies for file operations
+pathlib2
+mimetypes-magic
+
+# Logging and utilities
+python-dateutil
