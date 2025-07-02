@@ -8,9 +8,11 @@ A comprehensive Python library for building RAG (Retrieval-Augmented Generation)
 - **Document Processing**: Integration with MarkItDown for extracting content from various file formats
 - **Image Extraction & Analysis**: Extract images from PDFs and Word documents with Azure OpenAI Vision analysis
 - **Markdown Generation**: Generate comprehensive markdown files with embedded image descriptions and metadata
+- **Search Index Management**: Azure Cognitive Search integration with vector embeddings and semantic search
 - **File Operations**: Upload, download, and manage files with comprehensive statistics
 - **Bulk Operations**: Support for uploading/downloading entire folders or containers
 - **Connection Management**: Robust connection verification and error handling
+- **Error Recovery**: Graceful handling of search index upload errors with detailed logging
 
 ## Supported File Types
 
@@ -25,6 +27,26 @@ HEALRAG uses MarkItDown to extract content from the following file types:
 - **E-books**: EPub
 - **Text**: TXT files
 - **Media**: YouTube URLs
+
+## Recent Fixes and Improvements
+
+### Search Index Manager Enhancements (Latest)
+
+The SearchIndexManager has been enhanced with improved error handling and validation:
+
+- **JSON Upload Fix**: Fixed issue with embedding field validation that was causing "StartArray" JSON parsing errors
+- **Document Validation**: Added comprehensive validation of document structure before upload
+- **Embedding Format Validation**: Ensures embeddings are valid 1536-dimensional vectors before upload
+- **Graceful Error Recovery**: Continues processing even if some chunks fail to upload
+- **Detailed Logging**: Enhanced logging for better debugging and monitoring
+- **Batch Processing**: Improved batch upload with individual error tracking
+
+### Error Handling Improvements
+
+- Better handling of missing or invalid embeddings
+- Graceful degradation when search index upload fails
+- Detailed error reporting for troubleshooting
+- Validation of search index schema compatibility
 
 ## Installation
 
@@ -171,6 +193,27 @@ ContentManager(storage_manager, azure_openai_endpoint=None, azure_openai_key=Non
 - `get_supported_file_types() -> List[str]`: Get supported file types for content extraction
 - `get_image_extraction_support() -> List[str]`: Get file types that support image extraction
 
+### SearchIndexManager Class
+
+#### Constructor
+```python
+SearchIndexManager(storage_manager, azure_openai_endpoint=None, azure_openai_key=None, azure_openai_deployment=None, azure_search_endpoint=None, azure_search_key=None, azure_search_index_name="healrag-index", chunk_size=1000, chunk_overlap=200)
+```
+
+#### Methods
+
+##### Index Management
+- `create_search_index() -> bool`: Create or verify Azure Cognitive Search index
+- `upload_chunks_to_index(chunks: List[Dict]) -> bool`: Upload chunks with embeddings to search index
+
+##### Content Processing
+- `chunk_markdown_content(content: str, source_file: str) -> List[Dict]`: Chunk markdown content into smaller pieces
+- `generate_embeddings(chunks: List[Dict]) -> List[Dict]`: Generate embeddings for text chunks using Azure OpenAI
+- `process_markdown_files(md_folder: str = "md_files") -> Dict`: Process all markdown files for search indexing
+
+##### Search Operations
+- `search_similar_chunks(query: str, top_k: int = 5) -> List[Dict]`: Search for similar chunks using vector similarity
+
 ## Configuration
 
 ### Environment Variables
@@ -182,10 +225,20 @@ Set the following environment variables:
 export AZURE_STORAGE_CONNECTION_STRING="your_connection_string"
 export AZURE_CONTAINER_NAME="your_container_name"
 
-# Optional: For Azure OpenAI integration (image analysis)
+# Optional: For Azure OpenAI integration (image analysis and embeddings)
 export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com/"
 export AZURE_OPENAI_KEY="your_openai_key"
 export AZURE_OPENAI_DEPLOYMENT="your_deployment_name"
+export AZURE_TEXT_EMBEDDING_MODEL="text-embedding-ada-002"
+
+# Optional: For Azure Cognitive Search integration
+export AZURE_SEARCH_ENDPOINT="https://your-search-service.search.windows.net"
+export AZURE_SEARCH_KEY="your_search_key"
+export AZURE_SEARCH_INDEX_NAME="healrag-index"
+
+# Optional: Search index configuration
+export CHUNK_SIZE="1000"
+export CHUNK_OVERLAP="200"
 
 
 ```
@@ -250,36 +303,92 @@ logging.basicConfig(
 
 ```python
 from healraglib import StorageManager
-import json
+from healraglib.content_manager import ContentManager
+from healraglib.search_index_manager import SearchIndexManager
+import os
 
-# Initialize storage manager
+# Initialize managers
 storage_manager = StorageManager(connection_string, container_name)
+content_manager = ContentManager(
+    storage_manager=storage_manager,
+    azure_openai_endpoint=azure_openai_endpoint,
+    azure_openai_key=azure_openai_key,
+    azure_openai_deployment=azure_openai_deployment
+)
+search_manager = SearchIndexManager(
+    storage_manager=storage_manager,
+    azure_openai_endpoint=azure_openai_endpoint,
+    azure_openai_key=azure_openai_key,
+    azure_openai_deployment=azure_text_embedding_model,
+    azure_search_endpoint=azure_search_endpoint,
+    azure_search_key=azure_search_key,
+    azure_search_index_name=azure_search_index_name
+)
 
-# Upload documents
+# Step 1: Upload documents
 storage_manager.upload_folder("documents", prefix="corpus")
 
-# Get statistics
-stats = storage_manager.get_container_statistics()
-print(f"Uploaded {stats['total_files']} documents")
+# Step 2: Extract content and generate markdown
+supported_files = content_manager.get_source_files_from_container()
+results = content_manager.extract_content_from_files(
+    supported_files, 
+    output_folder="md_files", 
+    extract_images=True
+)
 
-# Extract content from all supported files
-extracted_content = {}
-file_list = storage_manager.get_file_list(as_json=False)
+# Step 3: Process markdown files for search indexing
+index_results = search_manager.process_markdown_files("md_files")
 
-for file_name in file_list:
-    if any(file_name.lower().endswith(ext) for ext in storage_manager.get_supported_file_types()):
-        try:
-            content = storage_manager.get_file_content_with_markitdown(file_name)
-            extracted_content[file_name] = content
-            print(f"Extracted content from {file_name}")
-        except Exception as e:
-            print(f"Failed to extract content from {file_name}: {e}")
+if index_results.get('success'):
+    print(f"✅ Indexed {index_results['chunks_with_embeddings']} chunks with embeddings")
+    
+    # Step 4: Search for similar content
+    query = "cyber security policy"
+    search_results = search_manager.search_similar_chunks(query, top_k=5)
+    
+    print(f"Search results for '{query}':")
+    for i, result in enumerate(search_results, 1):
+        print(f"{i}. {result['source_file']} (Score: {result['score']:.3f})")
+        print(f"   Section: {result['section']}")
+        print(f"   Content: {result['content'][:100]}...")
+else:
+    print(f"❌ Search indexing failed: {index_results.get('error')}")
+```
 
-# Save extracted content
-with open("extracted_content.json", "w") as f:
-    json.dump(extracted_content, f, indent=2)
+### Search Index Management Example
 
-print(f"Extracted content from {len(extracted_content)} files")
+```python
+from healraglib.search_index_manager import SearchIndexManager
+
+# Initialize search index manager
+search_manager = SearchIndexManager(
+    storage_manager=storage_manager,
+    azure_openai_endpoint=azure_openai_endpoint,
+    azure_openai_key=azure_openai_key,
+    azure_openai_deployment=azure_text_embedding_model,
+    azure_search_endpoint=azure_search_endpoint,
+    azure_search_key=azure_search_key,
+    azure_search_index_name="my-search-index"
+)
+
+# Create or verify search index
+if search_manager.create_search_index():
+    print("✅ Search index ready")
+    
+    # Process markdown files
+    results = search_manager.process_markdown_files("md_files")
+    print(f"Processed {results['files_processed']} files")
+    print(f"Created {results['total_chunks']} chunks")
+    print(f"Generated {results['chunks_with_embeddings']} embeddings")
+    
+    # Search for similar content
+    query = "information security"
+    results = search_manager.search_similar_chunks(query, top_k=3)
+    
+    for result in results:
+        print(f"Found: {result['source_file']} - {result['section']}")
+else:
+    print("❌ Failed to create search index")
 ```
 
 ## Testing

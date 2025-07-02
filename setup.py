@@ -41,7 +41,7 @@ setup(
         "Topic :: Text Processing :: Markup",
         "Topic :: Database",
     ],
-    python_requires=">=3.7",
+    python_requires=">=3.11",
     install_requires=read_requirements(),
     extras_require={
         "dev": [

@@ -4,6 +4,9 @@
 azure-storage-blob
 azure-core
 
+# Azure Search
+azure-search-documents
+
 # MarkItDown for document processing
 markitdown[all]
 

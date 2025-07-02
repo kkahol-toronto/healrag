@@ -539,6 +539,37 @@ class ContentManager:
         """Get list of file types that support image extraction."""
         return ['.pdf', '.docx', '.doc']
     
+    def get_source_files_from_container(self, exclude_folders: List[str] = None) -> List[str]:
+        """
+        Get list of source files from container, excluding specified folders and unsupported file types.
+        
+        Args:
+            exclude_folders: List of folder names to exclude (default: ['md_files'])
+            
+        Returns:
+            List of source file paths ready for processing
+        """
+        if exclude_folders is None:
+            exclude_folders = ['md_files']
+        
+        # Get all files from container
+        all_files = self.storage_manager.get_file_list(as_json=False)
+        
+        # Filter out excluded folders and unsupported file types
+        supported_types = self.get_supported_file_types()
+        source_files = []
+        
+        for file_path in all_files:
+            # Skip files in excluded folders
+            if any(file_path.startswith(folder + '/') for folder in exclude_folders):
+                continue
+            
+            # Only include supported file types
+            if Path(file_path).suffix.lower() in supported_types:
+                source_files.append(file_path)
+        
+        return source_files
+    
     def _fallback_content_extraction(self, file_path: str) -> str:
         """Fallback content extraction for basic file types."""
         file_ext = Path(file_path).suffix.lower()
