@@ -380,18 +380,69 @@ curl -s http://localhost:8000/search/test | python -m json.tool
 
 ### Authentication Endpoints
 
-HEALRAG includes OAuth2-based authentication for secure access to the API.
+HEALRAG includes **Azure AD OAuth2-based authentication** for secure access to the API. Most endpoints require authentication, and the system provides a streamlined workflow for obtaining and using access tokens.
+
+#### 🔐 Authentication Workflow
+
+**Step 1: Initiate Login**
+```
+GET /auth/login
+```
+Start the Azure AD OAuth2 authentication flow by visiting this endpoint in your browser.
+
+**Step 2: Complete Authentication**
+After successful authentication, you'll be redirected back to the root URL with your access token:
+```
+https://your-domain.com/?token=eyJ0eXAiOiJKV1Q...&expires_in=3600
+```
+
+**Step 3: Extract and Use Token**
+The root endpoint (`/`) will display your token clearly when you visit with the token parameter:
+
+**Expected Response:**
+```json
+{
+    "🎉 SUCCESS": "Authentication completed! Copy the token below:",
+    "📋 ACCESS_TOKEN": "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIs...",
+    "⏰ EXPIRES_IN": "3600 seconds",
+    "📖 USAGE_INSTRUCTIONS": {
+        "1": "Copy the ACCESS_TOKEN above",
+        "2": "Go to /docs (Swagger UI)",
+        "3": "Click 'Authorize' button (🔒)",
+        "4": "Enter: Bearer eyJ0eXAiOiJKV1Q...",
+        "5": "Now you can test all protected endpoints!"
+    },
+    "🔗 SWAGGER_URL": "/docs"
+}
+```
+
+**Step 4: Use in Swagger UI**
+1. Copy the `ACCESS_TOKEN` from the response above
+2. Go to `/docs` (Swagger UI)
+3. Click the **"Authorize"** button (🔒 icon)
+4. In the "HTTPBearer" field, enter: `Bearer YOUR_ACCESS_TOKEN`
+5. Click "Authorize" and "Close"
+6. You can now test all protected endpoints!
+
+**Step 5: Use in curl/API calls**
+Include the token in the Authorization header:
+```bash
+curl -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  https://your-domain.com/protected-endpoint
+```
+
+#### 🔐 Authentication Endpoints
 
 #### 🔐 GET `/auth/login` - Initiate Login
-Start the OAuth2 authentication flow.
+Start the Azure AD OAuth2 authentication flow.
 
 **Browser URL:**
 ```
-http://localhost:8000/auth/login
+https://your-domain.com/auth/login
 ```
 
 #### 🔐 GET `/auth/callback` - OAuth Callback
-OAuth2 callback endpoint (handled automatically by the authentication flow).
+Azure AD OAuth2 callback endpoint (handled automatically by the authentication flow).
 
 #### 👤 GET `/auth/me` - Get Current User Info
 Get information about the currently authenticated user.
@@ -399,33 +450,56 @@ Get information about the currently authenticated user.
 **curl command (with Bearer token):**
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  http://localhost:8000/auth/me
+  https://your-domain.com/auth/me
 ```
 
 **Expected Response:**
 ```json
 {
-    "user_id": "user123",
-    "email": "user@example.com",
+    "user_id": "422bc4f6-8de4-4bc8-8e90-23a7f8b8b3f1",
+    "email": "user@company.com",
     "name": "John Doe",
-    "authenticated": true
+    "roles": []
 }
 ```
 
 #### 🚪 GET `/auth/logout` - Logout
-Log out the current user and invalidate the session.
+Log out the current user and invalidate the Azure AD session.
 
 **Browser URL:**
 ```
-http://localhost:8000/auth/logout
+https://your-domain.com/auth/logout
 ```
 
-#### 🧪 GET `/auth/test-simple` - Test Authentication
-Simple endpoint to test if authentication is working.
+#### 🧪 GET `/auth/test-token` - Test Token Validity
+Test endpoint to verify your token is working and get user information.
 
 **curl command:**
 ```bash
-curl -s http://localhost:8000/auth/test-simple
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  https://your-domain.com/auth/test-token
+```
+
+**Expected Response:**
+```json
+{
+    "message": "🎉 Token is valid!",
+    "user": {
+        "user_id": "422bc4f6-8de4-4bc8-8e90-23a7f8b8b3f1",
+        "email": "user@company.com",
+        "name": "John Doe"
+    },
+    "timestamp": "2025-01-02T04:47:19.123456"
+}
+```
+
+#### 🛠️ GET `/debug/token` - Debug Token Information
+Debug endpoint to inspect token contents and validate configuration.
+
+**curl command:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  https://your-domain.com/debug/token
 ```
 
 ### Session Management Endpoints
@@ -741,6 +815,17 @@ AZURE_TEXT_EMBEDDING_MODEL=text-embedding-ada-002
 AZURE_SEARCH_ENDPOINT=https://your-search.search.windows.net
 AZURE_SEARCH_KEY=your-search-key
 AZURE_SEARCH_INDEX_NAME=your-index-name
+
+# Azure AD Authentication (Required for API access)
+AZURE_AD_TENANT_ID=your-azure-ad-tenant-id
+AZURE_AD_CLIENT_ID=your-azure-ad-app-registration-client-id
+AZURE_AD_CLIENT_SECRET=your-azure-ad-app-registration-client-secret
+AZURE_AD_REDIRECT_URI=https://your-webapp.azurewebsites.net/auth/callback
+
+# Azure Cosmos DB (Optional - for chat history)
+AZURE_COSMO_CONNECTION_STRING=AccountEndpoint=https://your-account.documents.azure.com:443/;AccountKey=your-key;
+AZURE_COSMO_DB_NAME=your-database-name
+AZURE_COSMO_DB_CONTAINER=chats
 ```
 
 #### Container Registry (for deployment)
@@ -801,6 +886,26 @@ ERROR - unauthorized: authentication required
 az webapp log tail --name your-webapp --resource-group your-rg
 ```
 
+**4. Azure AD Authentication Issues:**
+```
+{"message": "HEALRAG Security Assistant API - Authentication Required"}
+```
+**Solution:** Ensure all Azure AD environment variables are set:
+- `AZURE_AD_TENANT_ID` - Your Azure AD tenant ID
+- `AZURE_AD_CLIENT_ID` - Your App Registration client ID
+- `AZURE_AD_CLIENT_SECRET` - Your App Registration client secret
+- `AZURE_AD_REDIRECT_URI` - Should match your deployment URL + `/auth/callback`
+
+**5. Token Authentication Failures:**
+```
+{"detail": "Not authenticated"}
+```
+**Solution:** 
+1. Get a fresh token by visiting `/auth/login`
+2. Copy the token from the URL or root endpoint response
+3. Use it as `Bearer YOUR_TOKEN` in the Authorization header
+4. Verify token isn't expired (check `expires_in` value)
+
 #### Deployment Script Help
 
 ```bash
@@ -844,7 +949,7 @@ az webapp update --name healrag-security --resource-group myRG --instance-count 
 - **Search Indexing**: Vector embeddings with Azure Cognitive Search for semantic document retrieval
 - **Docker & Cloud Ready**: Production-ready containerization with Azure App Service deployment
 - **Continuous Deployment**: Automated CI/CD pipeline with webhooks and zero-downtime updates
-- **Authentication**: OAuth2-based security for API access control
+- **Azure AD Authentication**: OAuth2-based security with Azure Active Directory integration for secure API access control
 - **Monitoring**: Comprehensive health checks, logging, and error handling
 
 ## 📦 Installation & Setup
@@ -853,7 +958,9 @@ az webapp update --name healrag-security --resource-group myRG --instance-count 
 - Python 3.11 or higher
 - Azure Storage Account
 - Azure OpenAI Service
+- Azure Active Directory App Registration (for authentication)
 - Azure Cognitive Search Service (optional)
+- Azure Cosmos DB Account (optional, for chat history)
 - Docker Desktop (for containerization)
 
 ### Quick Installation
@@ -896,6 +1003,12 @@ AZURE_SEARCH_INDEX_NAME=healrag-index
 AZURE_COSMO_CONNECTION_STRING=AccountEndpoint=https://your-account.documents.azure.com:443/;AccountKey=your-key;
 AZURE_COSMO_DB_NAME=your-database-name
 AZURE_COSMO_DB_CONTAINER=chats
+
+# Required: Azure AD Authentication
+AZURE_AD_TENANT_ID=your-azure-ad-tenant-id
+AZURE_AD_CLIENT_ID=your-azure-ad-app-registration-client-id
+AZURE_AD_CLIENT_SECRET=your-azure-ad-app-registration-client-secret
+AZURE_AD_REDIRECT_URI=https://your-domain.com/auth/callback
 ```
 
 ## 📖 Python Library Usage
