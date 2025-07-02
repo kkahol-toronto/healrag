@@ -79,6 +79,7 @@ class RAGManager:
                              temperature: Optional[float] = None,
                              max_tokens: Optional[int] = None,
                              include_search_details: bool = False,
+                             conversation_history: Optional[List[Dict[str, str]]] = None,
                              **kwargs) -> Dict[str, Any]:
         """
         Generate a non-streaming RAG response.
@@ -90,6 +91,7 @@ class RAGManager:
             temperature: LLM temperature (optional)
             max_tokens: Maximum response tokens (optional)
             include_search_details: Whether to include detailed search info in response
+            conversation_history: Previous conversation exchanges for context (optional)
             **kwargs: Additional parameters for LLM generation
             
         Returns:
@@ -111,7 +113,7 @@ class RAGManager:
             if not retrieved_docs:
                 # No relevant documents found
                 return self._generate_no_context_response(
-                    query, temperature, max_tokens, **kwargs
+                    query, temperature, max_tokens, conversation_history, **kwargs
                 )
             
             # Step 2: Build context from retrieved documents
@@ -119,7 +121,7 @@ class RAGManager:
             
             # Step 3: Create system message with context
             system_message = self._create_rag_system_message(
-                context, custom_system_prompt
+                context, custom_system_prompt, conversation_history
             )
             
             # Step 4: Generate LLM response
@@ -212,6 +214,7 @@ class RAGManager:
                                        custom_system_prompt: Optional[str] = None,
                                        temperature: Optional[float] = None,
                                        max_tokens: Optional[int] = None,
+                                       conversation_history: Optional[List[Dict[str, str]]] = None,
                                        **kwargs) -> Iterator[Dict[str, Any]]:
         """
         Generate a streaming RAG response.
@@ -222,6 +225,7 @@ class RAGManager:
             custom_system_prompt: Custom system prompt template (optional)
             temperature: LLM temperature (optional)
             max_tokens: Maximum response tokens (optional)
+            conversation_history: Previous conversation exchanges for context (optional)
             **kwargs: Additional parameters for LLM generation
             
         Yields:
@@ -257,12 +261,20 @@ class RAGManager:
                 yield {
                     "type": "no_context",
                     "status": "no_relevant_documents",
-                    "message": "No relevant documents found. Generating response without context."
+                    "message": "No relevant documents found. Generating response with conversation history only."
                 }
                 
-                # Generate response without context
+                # Create system message with conversation history even without document context
+                system_message = self._create_rag_system_message(
+                    context="No relevant documents found for this query.",
+                    custom_prompt=custom_system_prompt,
+                    conversation_history=conversation_history
+                )
+                
+                # Generate response with conversation history but without document context
                 for chunk in self.llm_manager.generate_streaming_response(
-                    query=f"I don't have specific context for this query. Please provide a helpful general response: {query}",
+                    query=query,
+                    system_message=system_message,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     **kwargs
@@ -270,6 +282,7 @@ class RAGManager:
                     # Add RAG metadata to chunks
                     chunk["rag_metadata"] = {
                         "has_context": False,
+                        "has_conversation_history": conversation_history is not None and len(conversation_history) > 0,
                         "documents_used": 0
                     }
                     yield chunk
@@ -286,7 +299,7 @@ class RAGManager:
             
             # Step 3: Create system message
             system_message = self._create_rag_system_message(
-                context, custom_system_prompt
+                context, custom_system_prompt, conversation_history
             )
             
             # Yield context ready status
@@ -414,34 +427,70 @@ class RAGManager:
         self.logger.info(f"Built context from {len(sources)} documents ({current_tokens} estimated tokens)")
         return context, sources
     
-    def _create_rag_system_message(self, context: str, custom_prompt: Optional[str] = None) -> str:
-        """Create system message with retrieved context."""
-        if custom_prompt:
-            # Use custom prompt template - should include {context} placeholder
-            try:
-                return custom_prompt.format(context=context)
-            except KeyError:
-                self.logger.warning("Custom prompt missing {context} placeholder, appending context")
-                return f"{custom_prompt}\n\nRelevant Context:\n{context}"
+    def _create_rag_system_message(self, context: str, custom_prompt: Optional[str] = None, conversation_history: Optional[List[Dict[str, str]]] = None) -> str:
+        """Create system message with retrieved context and conversation history."""
+        # Build conversation history section
+        history_section = ""
+        if conversation_history and len(conversation_history) > 0:
+            history_section = "\n\nConversation History (for context):\n"
+            for i, exchange in enumerate(conversation_history[-10:], 1):  # Last 10 exchanges
+                query = exchange.get('query', '')
+                response = exchange.get('response', '')
+                history_section += f"Exchange {i}:\n"
+                history_section += f"User: {query}\n"
+                history_section += f"Assistant: {response}\n\n"
         
-        # Default RAG system message
-        default_prompt = """You are a helpful AI assistant with access to relevant document context. 
-Use the provided context to answer the user's question accurately and comprehensively.
+        if custom_prompt:
+            # Use custom prompt template - should include {context} and optionally {history} placeholders
+            try:
+                if "{history}" in custom_prompt:
+                    return custom_prompt.format(context=context, history=history_section)
+                else:
+                    return custom_prompt.format(context=context) + history_section
+            except KeyError:
+                self.logger.warning("Custom prompt missing {context} placeholder, appending context and history")
+                return f"{custom_prompt}\n\nRelevant Context:\n{context}{history_section}"
+        
+        # Default RAG system message with conversation history
+        if "No relevant documents found" in context:
+            # Special case: no document context but potentially conversation history
+            if conversation_history and len(conversation_history) > 0:
+                default_prompt = """You are a helpful AI assistant with access to conversation history. 
+While no relevant documents were found for this specific query, use the conversation history to understand the context and provide a helpful response.
+
+Guidelines:
+- Use conversation history to understand what the user is referring to
+- Reference previous exchanges to provide contextual continuity
+- If the query refers to something discussed earlier, acknowledge and build upon that discussion
+- Be helpful and provide relevant information based on the conversation flow
+- If you cannot fully answer based on conversation history alone, acknowledge this limitation{history}
+
+Please provide a helpful response based on the conversation history."""
+            else:
+                default_prompt = """You are a helpful AI assistant. No relevant documents were found for this query, and there is no conversation history available.
+
+Please provide a helpful general response to the user's question: {context}"""
+        else:
+            # Normal case: document context available
+            default_prompt = """You are a helpful AI assistant with access to relevant document context and conversation history. 
+Use the provided context to answer the user's question accurately and comprehensively, taking into account the conversation history for better contextual understanding.
 
 Guidelines:
 - Base your response primarily on the provided context
+- Use conversation history to understand the flow of the discussion and provide contextually relevant answers
 - If the context doesn't contain enough information, acknowledge this limitation
 - Cite specific sources when making claims
 - Provide direct quotes when helpful
 - If asked about something not in the context, clearly state this
 - Be concise but thorough in your responses
+- Reference previous exchanges when relevant to provide continuity{history}
 
 Relevant Context:
 {context}
 
-Please provide helpful, accurate responses based on this context."""
+Please provide helpful, accurate responses based on this context and conversation history."""
         
-        return default_prompt.format(context=context)
+        return default_prompt.format(context=context, history=history_section)
     
     def _extract_sources(self, retrieved_docs: List[Dict]) -> List[Dict]:
         """Extract simplified source information from retrieved documents."""
@@ -456,12 +505,18 @@ Please provide helpful, accurate responses based on this context."""
         return sources
     
     def _generate_no_context_response(self, query: str, temperature: Optional[float], 
-                                    max_tokens: Optional[int], **kwargs) -> Dict[str, Any]:
-        """Generate response when no relevant context is found."""
-        no_context_query = f"I don't have specific context documents for this query. Please provide a helpful general response: {query}"
+                                    max_tokens: Optional[int], conversation_history: Optional[List[Dict[str, str]]] = None, **kwargs) -> Dict[str, Any]:
+        """Generate response when no relevant context is found but include conversation history."""
+        # Create system message with conversation history even without document context
+        system_message = self._create_rag_system_message(
+            context="No relevant documents found for this query.",
+            custom_prompt=None,
+            conversation_history=conversation_history
+        )
         
         llm_result = self.llm_manager.generate_response(
-            query=no_context_query,
+            query=query,
+            system_message=system_message,
             temperature=temperature,
             max_tokens=max_tokens,
             **kwargs
@@ -475,6 +530,8 @@ Please provide helpful, accurate responses based on this context."""
                 "query": query,
                 "metadata": {
                     "has_context": False,
+                    "has_conversation_history": conversation_history is not None and len(conversation_history) > 0,
+                    "conversation_exchanges_used": len(conversation_history) if conversation_history else 0,
                     "retrieval": {
                         "documents_found": 0,
                         "documents_used": 0
@@ -492,6 +549,8 @@ Please provide helpful, accurate responses based on this context."""
                 "query": query,
                 "metadata": {
                     "has_context": False,
+                    "has_conversation_history": conversation_history is not None and len(conversation_history) > 0,
+                    "conversation_exchanges_used": len(conversation_history) if conversation_history else 0,
                     "timestamp": datetime.now().isoformat()
                 }
             }

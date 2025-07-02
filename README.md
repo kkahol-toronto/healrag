@@ -260,14 +260,16 @@ curl -X POST "http://localhost:8000/training/stop" \
 ### RAG Query Endpoints
 
 #### 🤖 POST `/rag/query` - RAG Question Answering
-Ask questions and get AI-powered answers based on your indexed documents.
+Ask questions and get AI-powered answers based on your indexed documents. When a `session_id` is provided, the system automatically includes the last 10 conversation exchanges as context for more coherent and contextually aware responses. **Even when no relevant documents are found**, the system will still use conversation history to provide contextual responses.
 
 **curl command:**
 ```bash
 curl -X POST "http://localhost:8000/rag/query" \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
   -d '{
     "query": "What are the key principles of information security?",
+    "session_id": "user123_20250101_session1",
     "top_k": 5,
     "include_sources": true
   }'
@@ -295,14 +297,16 @@ curl -X POST "http://localhost:8000/rag/query" \
 ```
 
 #### 🌊 POST `/rag/stream` - Streaming RAG Response
-Get streaming RAG responses for real-time AI interactions.
+Get streaming RAG responses for real-time AI interactions. When a `session_id` is provided, the system automatically includes the last 10 conversation exchanges as context for more coherent and contextually aware responses. **Even when no relevant documents are found**, the system will still use conversation history to provide contextual responses.
 
 **curl command:**
 ```bash
 curl -X POST "http://localhost:8000/rag/stream" \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
   -d '{
     "query": "Explain data classification requirements",
+    "session_id": "user123_20250101_session1",
     "top_k": 3
   }' \
   --no-buffer
@@ -422,6 +426,126 @@ Simple endpoint to test if authentication is working.
 **curl command:**
 ```bash
 curl -s http://localhost:8000/auth/test-simple
+```
+
+### Session Management Endpoints
+
+HEALRAG includes Azure Cosmos DB integration for storing and managing chat sessions and conversation history.
+
+#### 📜 POST `/sessions/history` - Get Session History
+Retrieve conversation history for a specific session.
+
+**curl command:**
+```bash
+curl -X POST "http://localhost:8000/sessions/history" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "user123_20250101_session1",
+    "limit": 50,
+    "include_metadata": false
+  }'
+```
+
+**Expected Response:**
+```json
+{
+    "success": true,
+    "session_id": "user123_20250101_session1",
+    "interactions": [
+        {
+            "id": "user123_20250101_session1_2025-01-01T10:30:00.123456_1234",
+            "sessionID": "user123_20250101_session1",
+            "query": "What is our security policy?",
+            "response": "Our security policy encompasses several key areas...",
+            "user_info": {
+                "user_id": "user123",
+                "email": "user@company.com",
+                "name": "John Doe"
+            },
+            "sources": [
+                {
+                    "source_file": "security_policy.pdf",
+                    "relevance_score": 0.95
+                }
+            ],
+            "timestamp": "2025-01-01T10:30:00.123456"
+        }
+    ],
+    "total_count": 1,
+    "error": null
+}
+```
+
+#### 👤 GET `/sessions/user` - Get User Sessions
+Retrieve all sessions for the current authenticated user.
+
+**curl command:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8000/sessions/user?limit=20"
+```
+
+**Expected Response:**
+```json
+{
+    "success": true,
+    "user_identifier": "user@company.com",
+    "sessions": [
+        {
+            "sessionID": "user123_20250101_session1",
+            "first_interaction": "2025-01-01T10:30:00.123456",
+            "last_interaction": "2025-01-01T11:45:00.789012",
+            "interaction_count": 15
+        },
+        {
+            "sessionID": "user123_20241231_session2",
+            "first_interaction": "2024-12-31T14:20:00.456789",
+            "last_interaction": "2024-12-31T15:30:00.123456",
+            "interaction_count": 8
+        }
+    ],
+    "total_count": 2
+}
+```
+
+#### 🗑️ DELETE `/sessions/{session_id}` - Delete Session
+Delete a specific session and all its conversation history.
+
+**curl command:**
+```bash
+curl -X DELETE "http://localhost:8000/sessions/user123_20250101_session1" \
+  -H "Authorization: Bearer YOUR_TOKEN"
+```
+
+**Expected Response:**
+```json
+{
+    "success": true,
+    "message": "Session user123_20250101_session1 deleted successfully",
+    "session_id": "user123_20250101_session1"
+}
+```
+
+#### 📊 GET `/cosmo/stats` - CosmoDB Statistics
+Get statistics about the Cosmos DB chat container.
+
+**curl command:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  http://localhost:8000/cosmo/stats
+```
+
+**Expected Response:**
+```json
+{
+    "total_interactions": 1250,
+    "unique_sessions": 85,
+    "unique_users": 12,
+    "container_name": "chats",
+    "database_name": "healrag-db",
+    "partition_key": "/sessionID"
+}
 ```
 
 ---
@@ -714,7 +838,9 @@ az webapp update --name healrag-security --resource-group myRG --instance-count 
 - **Comprehensive FastAPI Application**: Complete REST API with health checks, training pipelines, RAG querying, and search endpoints
 - **Azure Blob Storage Integration**: Full file management with upload, download, and statistics
 - **Document Processing**: MarkItDown integration for extracting content from PDFs, Office docs, images, and more
-- **RAG System**: Advanced question-answering with streaming responses and source attribution
+- **RAG System**: Advanced question-answering with streaming responses, source attribution, and conversation context
+- **Conversation Context**: Automatically includes last 10 conversation exchanges for contextually aware responses
+- **Chat History & Session Management**: Azure Cosmos DB integration for storing conversation history with session-based organization
 - **Search Indexing**: Vector embeddings with Azure Cognitive Search for semantic document retrieval
 - **Docker & Cloud Ready**: Production-ready containerization with Azure App Service deployment
 - **Continuous Deployment**: Automated CI/CD pipeline with webhooks and zero-downtime updates
@@ -765,6 +891,11 @@ AZURE_TEXT_EMBEDDING_MODEL=text-embedding-ada-002
 AZURE_SEARCH_ENDPOINT=https://your-search.search.windows.net
 AZURE_SEARCH_KEY=your-search-key
 AZURE_SEARCH_INDEX_NAME=healrag-index
+
+# Optional: Azure Cosmos DB (for chat history)
+AZURE_COSMO_CONNECTION_STRING=AccountEndpoint=https://your-account.documents.azure.com:443/;AccountKey=your-key;
+AZURE_COSMO_DB_NAME=your-database-name
+AZURE_COSMO_DB_CONTAINER=chats
 ```
 
 ## 📖 Python Library Usage

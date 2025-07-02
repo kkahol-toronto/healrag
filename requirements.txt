@@ -7,6 +7,9 @@ azure-core
 # Azure Search
 azure-search-documents
 
+# Azure Cosmos DB
+azure-cosmos
+
 # MarkItDown for document processing
 markitdown[all]
 

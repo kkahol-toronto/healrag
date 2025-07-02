@@ -15,6 +15,7 @@ from .content_manager import ContentManager
 from .search_index_manager import SearchIndexManager
 from .llm_manager import LLMManager
 from .rag_manager import RAGManager
+from .cosmo_db_manager import CosmoDBManager
 
 # Convenience imports
 __all__ = [
@@ -22,7 +23,8 @@ __all__ = [
     "ContentManager", 
     "SearchIndexManager",
     "LLMManager",
-    "RAGManager"
+    "RAGManager",
+    "CosmoDBManager"
 ]
 
 def get_version():

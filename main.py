@@ -39,7 +39,7 @@ except ImportError:
     pass
 
 # Import HEALRAG components
-from healraglib import StorageManager, RAGManager, LLMManager, SearchIndexManager
+from healraglib import StorageManager, RAGManager, LLMManager, SearchIndexManager, CosmoDBManager
 from healraglib.content_manager import ContentManager
 
 # Configure logging
@@ -95,6 +95,7 @@ content_manager: Optional[ContentManager] = None
 search_manager: Optional[SearchIndexManager] = None
 llm_manager: Optional[LLMManager] = None
 rag_manager: Optional[RAGManager] = None
+cosmo_db_manager: Optional[CosmoDBManager] = None
 
 # Training pipeline status tracking
 training_status = {
@@ -132,6 +133,7 @@ class TrainingStatusResponse(BaseModel):
 
 class RAGRequest(BaseModel):
     query: str = Field(..., description="The question or query to answer")
+    session_id: Optional[str] = Field(None, description="Session ID for tracking conversations")
     top_k: int = Field(default=3, ge=1, le=20, description="Number of documents to retrieve")
     temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="LLM temperature")
     max_tokens: int = Field(default=500, ge=50, le=2000, description="Maximum response tokens")
@@ -160,6 +162,18 @@ class UserInfo(BaseModel):
     email: Optional[str]
     name: Optional[str]
     roles: List[str] = []
+
+class SessionHistoryRequest(BaseModel):
+    session_id: str = Field(..., description="Session ID to retrieve history for")
+    limit: Optional[int] = Field(default=50, ge=1, le=200, description="Maximum number of interactions to return")
+    include_metadata: bool = Field(default=False, description="Include metadata in response")
+
+class SessionHistoryResponse(BaseModel):
+    success: bool
+    session_id: str
+    interactions: List[Dict[str, Any]]
+    total_count: int
+    error: Optional[str] = None
 
 # Authentication functions
 async def get_azure_ad_jwks():
@@ -390,7 +404,7 @@ def get_configuration() -> Dict[str, Any]:
 
 async def initialize_components():
     """Initialize all HEALRAG components."""
-    global storage_manager, content_manager, search_manager, llm_manager, rag_manager
+    global storage_manager, content_manager, search_manager, llm_manager, rag_manager, cosmo_db_manager
     
     try:
         config = get_configuration()
@@ -450,6 +464,26 @@ async def initialize_components():
                 relevance_threshold=0.02
             )
             logger.info("RAG Manager initialized")
+        
+        # Initialize CosmoDB Manager (optional)
+        cosmo_connection_string = os.getenv("AZURE_COSMO_CONNECTION_STRING")
+        if cosmo_connection_string:
+            try:
+                cosmo_db_manager = CosmoDBManager(
+                    connection_string=cosmo_connection_string,
+                    database_name=os.getenv("AZURE_COSMO_DB_NAME"),
+                    container_name=os.getenv("AZURE_COSMO_DB_CONTAINER", "chats")
+                )
+                if cosmo_db_manager.verify_connection():
+                    logger.info("CosmoDB Manager initialized successfully")
+                else:
+                    logger.warning("CosmoDB Manager connection verification failed")
+                    cosmo_db_manager = None
+            except Exception as e:
+                logger.warning(f"CosmoDB Manager initialization failed: {e}")
+                cosmo_db_manager = None
+        else:
+            logger.info("CosmoDB Manager not configured (optional)")
         
         logger.info("All components initialized successfully")
         
@@ -644,6 +678,7 @@ async def health_check():
         "search_manager": search_manager is not None,
         "llm_manager": llm_manager is not None,
         "rag_manager": rag_manager is not None,
+        "cosmo_db_manager": cosmo_db_manager is not None,
         "azure_ad_config": all([
             AZURE_AD_CONFIG["tenant_id"],
             AZURE_AD_CONFIG["client_id"],
@@ -662,6 +697,8 @@ async def health_check():
         if rag_manager:
             validation = rag_manager.validate_configuration()
             connectivity["rag_system"] = validation["valid"]
+        if cosmo_db_manager:
+            connectivity["azure_cosmos_db"] = cosmo_db_manager.verify_connection()
     except Exception as e:
         logger.error(f"Health check error: {e}")
         connectivity["error"] = str(e)
@@ -750,19 +787,68 @@ async def rag_query(
     logger.info(f"RAG query by {current_user.email}: {request.query[:100]}...")
     
     try:
+        # Get conversation history if session_id is provided
+        conversation_history = []
+        if cosmo_db_manager and request.session_id:
+            try:
+                history_items = cosmo_db_manager.get_session_history(
+                    session_id=request.session_id,
+                    limit=10  # Get last 10 interactions
+                )
+                if history_items:
+                    # Convert to the format expected by RAG manager, excluding any interaction with the current query
+                    conversation_history = [
+                        {
+                            "query": interaction.get("query", ""),
+                            "response": interaction.get("response", "")
+                        }
+                        for interaction in history_items
+                        if interaction.get("query", "") != request.query  # Exclude current query if already stored
+                    ]
+                    logger.info(f"Retrieved {len(conversation_history)} previous interactions for context")
+            except Exception as history_error:
+                logger.warning(f"Failed to retrieve conversation history: {history_error}")
+                # Continue without history if retrieval fails
+        
         response = rag_manager.generate_rag_response(
             query=request.query,
             top_k=request.top_k,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             custom_system_prompt=request.custom_system_prompt,
-            include_search_details=request.include_search_details
+            include_search_details=request.include_search_details,
+            conversation_history=conversation_history
         )
         
         # Add user info to metadata
         if "metadata" not in response:
             response["metadata"] = {}
         response["metadata"]["user"] = current_user.email
+        
+        # Store interaction in CosmoDB if available and session_id provided
+        if cosmo_db_manager and request.session_id:
+            try:
+                # Prepare user info
+                user_info = {
+                    "user_id": current_user.user_id,
+                    "email": current_user.email,
+                    "name": current_user.name
+                }
+                
+                # Store the interaction
+                cosmo_db_manager.store_rag_interaction(
+                    session_id=request.session_id,
+                    query=request.query,
+                    response=response.get("response", ""),
+                    user_info=user_info,
+                    metadata=response.get("metadata", {}),
+                    sources=response.get("sources", [])
+                )
+                logger.info(f"Stored RAG interaction in CosmoDB for session {request.session_id}")
+                
+            except Exception as cosmo_error:
+                logger.warning(f"Failed to store interaction in CosmoDB: {cosmo_error}")
+                # Don't fail the request if CosmoDB storage fails
         
         return RAGResponse(**response)
         
@@ -783,17 +869,55 @@ async def rag_stream(
     
     async def generate_stream():
         """Generate streaming response."""
+        # Variables to collect the complete response for CosmoDB storage
+        full_response = ""
+        response_metadata = {}
+        response_sources = []
+        
+        # Get conversation history if session_id is provided
+        conversation_history = []
+        if cosmo_db_manager and request.session_id:
+            try:
+                history_items = cosmo_db_manager.get_session_history(
+                    session_id=request.session_id,
+                    limit=10  # Get last 10 interactions
+                )
+                if history_items:
+                    # Convert to the format expected by RAG manager, excluding any interaction with the current query
+                    conversation_history = [
+                        {
+                            "query": interaction.get("query", ""),
+                            "response": interaction.get("response", "")
+                        }
+                        for interaction in history_items
+                        if interaction.get("query", "") != request.query  # Exclude current query if already stored
+                    ]
+                    logger.info(f"Retrieved {len(conversation_history)} previous interactions for streaming context")
+            except Exception as history_error:
+                logger.warning(f"Failed to retrieve conversation history for streaming: {history_error}")
+                # Continue without history if retrieval fails
+        
         try:
             for chunk in rag_manager.generate_streaming_rag_response(
                 query=request.query,
                 top_k=request.top_k,
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
-                custom_system_prompt=request.custom_system_prompt
+                custom_system_prompt=request.custom_system_prompt,
+                conversation_history=conversation_history
             ):
                 # Add user info to metadata
                 if "rag_metadata" in chunk:
                     chunk["rag_metadata"]["user"] = current_user.email
+                
+                # Collect data for CosmoDB storage
+                if chunk.get("type") == "chunk":
+                    full_response += chunk.get("content", "")
+                elif chunk.get("type") == "sources":
+                    response_sources = chunk.get("sources", [])
+                elif chunk.get("type") == "complete":
+                    response_metadata = chunk.get("metadata", {})
+                    full_response = chunk.get("full_response", full_response)
                 
                 # Format chunk as Server-Sent Events
                 chunk_data = json.dumps(chunk)
@@ -801,6 +925,35 @@ async def rag_stream(
                 
                 # Add small delay to prevent overwhelming the client
                 await asyncio.sleep(0.01)
+            
+            # Store interaction in CosmoDB if available and session_id provided
+            if cosmo_db_manager and request.session_id and full_response:
+                try:
+                    # Prepare user info
+                    user_info = {
+                        "user_id": current_user.user_id,
+                        "email": current_user.email,
+                        "name": current_user.name
+                    }
+                    
+                    # Add user to metadata
+                    response_metadata["user"] = current_user.email
+                    response_metadata["stream_type"] = "streaming"
+                    
+                    # Store the complete interaction
+                    cosmo_db_manager.store_rag_interaction(
+                        session_id=request.session_id,
+                        query=request.query,
+                        response=full_response,
+                        user_info=user_info,
+                        metadata=response_metadata,
+                        sources=response_sources
+                    )
+                    logger.info(f"Stored streaming RAG interaction in CosmoDB for session {request.session_id}")
+                    
+                except Exception as cosmo_error:
+                    logger.warning(f"Failed to store streaming interaction in CosmoDB: {cosmo_error}")
+                    # Don't fail the stream if CosmoDB storage fails
             
             # Send completion signal
             yield f"data: {json.dumps({'type': 'stream_complete'})}\n\n"
@@ -901,7 +1054,8 @@ async def get_config(current_user: UserInfo = Depends(get_current_user)):
         "content_manager": content_manager is not None,
         "search_manager": search_manager is not None,
         "llm_manager": llm_manager is not None,
-        "rag_manager": rag_manager is not None
+        "rag_manager": rag_manager is not None,
+        "cosmo_db_manager": cosmo_db_manager is not None
     }
     
     if rag_manager:
@@ -935,6 +1089,130 @@ async def get_storage_stats(current_user: UserInfo = Depends(get_current_user)):
     except Exception as e:
         logger.error(f"Storage stats error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get storage stats: {str(e)}")
+
+# CosmoDB Chat History Endpoints
+@app.post("/sessions/history", response_model=SessionHistoryResponse)
+async def get_session_history(
+    request: SessionHistoryRequest,
+    current_user: UserInfo = Depends(get_current_user)
+):
+    """Get chat history for a specific session."""
+    if not cosmo_db_manager:
+        raise HTTPException(status_code=503, detail="CosmoDB Manager not available")
+    
+    logger.info(f"Session history request by {current_user.email} for session {request.session_id}")
+    
+    try:
+        interactions = cosmo_db_manager.get_session_history(
+            session_id=request.session_id,
+            limit=request.limit,
+            include_metadata=request.include_metadata
+        )
+        
+        return SessionHistoryResponse(
+            success=True,
+            session_id=request.session_id,
+            interactions=interactions,
+            total_count=len(interactions),
+            error=None
+        )
+        
+    except Exception as e:
+        logger.error(f"Session history error: {e}")
+        return SessionHistoryResponse(
+            success=False,
+            session_id=request.session_id,
+            interactions=[],
+            total_count=0,
+            error=str(e)
+        )
+
+@app.get("/sessions/user")
+async def get_user_sessions(
+    limit: int = 50,
+    current_user: UserInfo = Depends(get_current_user)
+):
+    """Get all sessions for the current user."""
+    if not cosmo_db_manager:
+        raise HTTPException(status_code=503, detail="CosmoDB Manager not available")
+    
+    logger.info(f"User sessions request by {current_user.email}")
+    
+    try:
+        # Use email as the primary identifier
+        user_identifier = current_user.email or current_user.user_id
+        sessions = cosmo_db_manager.get_user_sessions(
+            user_identifier=user_identifier,
+            limit=limit
+        )
+        
+        return {
+            "success": True,
+            "user_identifier": user_identifier,
+            "sessions": sessions,
+            "total_count": len(sessions)
+        }
+        
+    except Exception as e:
+        logger.error(f"User sessions error: {e}")
+        return {
+            "success": False,
+            "user_identifier": current_user.email or current_user.user_id,
+            "sessions": [],
+            "total_count": 0,
+            "error": str(e)
+        }
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(
+    session_id: str,
+    current_user: UserInfo = Depends(get_current_user)
+):
+    """Delete a specific session and all its interactions."""
+    if not cosmo_db_manager:
+        raise HTTPException(status_code=503, detail="CosmoDB Manager not available")
+    
+    logger.info(f"Session deletion request by {current_user.email} for session {session_id}")
+    
+    try:
+        # Verify the session belongs to the user before deletion
+        # This is a security measure to prevent users from deleting other users' sessions
+        user_identifier = current_user.email or current_user.user_id
+        user_sessions = cosmo_db_manager.get_user_sessions(user_identifier, limit=1000)
+        session_ids = [session.get("sessionID") for session in user_sessions]
+        
+        if session_id not in session_ids:
+            raise HTTPException(status_code=403, detail="Session not found or access denied")
+        
+        success = cosmo_db_manager.delete_session(session_id)
+        
+        if success:
+            return {
+                "success": True,
+                "message": f"Session {session_id} deleted successfully",
+                "session_id": session_id
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to delete session")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Session deletion error: {e}")
+        raise HTTPException(status_code=500, detail=f"Session deletion failed: {str(e)}")
+
+@app.get("/cosmo/stats")
+async def get_cosmo_stats(current_user: UserInfo = Depends(get_current_user)):
+    """Get CosmoDB container statistics."""
+    if not cosmo_db_manager:
+        raise HTTPException(status_code=503, detail="CosmoDB Manager not available")
+    
+    try:
+        stats = cosmo_db_manager.get_container_stats()
+        return stats
+    except Exception as e:
+        logger.error(f"CosmoDB stats error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get CosmoDB stats: {str(e)}")
 
 @app.get("/")
 async def root(user: Optional[UserInfo] = Depends(get_optional_user)):
