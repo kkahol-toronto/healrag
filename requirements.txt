@@ -21,6 +21,11 @@ openai>=1.0.0
 # Environment variable management
 python-dotenv>=1.0.0
 
+# FastAPI and web server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+
 # Additional dependencies for file operations
 pathlib2
 mimetypes-magic
