@@ -220,24 +220,48 @@ class CosmoDBManager:
             List of session summaries
         """
         try:
-            # Query for user sessions
+            # Simplified query to avoid aggregation issues
             query = """
-            SELECT DISTINCT c.sessionID, 
-                   MIN(c.timestamp) as first_interaction,
-                   MAX(c.timestamp) as last_interaction,
-                   COUNT(1) as interaction_count
+            SELECT c.sessionID, c.timestamp, c.query
             FROM c 
-            WHERE c.user_info.email = @user_id OR c.user_info.user_id = @user_id
-            GROUP BY c.sessionID
-            ORDER BY MAX(c.timestamp) DESC
+            WHERE (c.user_info.email = @user_id OR c.user_info.user_id = @user_id)
+            AND c.type = 'rag_interaction'
+            ORDER BY c.timestamp DESC
             """
             parameters = [{"name": "@user_id", "value": user_identifier}]
             
-            items = list(self.container.query_items(
+            raw_items = list(self.container.query_items(
                 query=query,
                 parameters=parameters,
                 enable_cross_partition_query=True
             ))
+            
+            # Group by session and calculate stats in Python
+            sessions = {}
+            for item in raw_items:
+                session_id = item['sessionID']
+                timestamp = item['timestamp']
+                
+                if session_id not in sessions:
+                    sessions[session_id] = {
+                        'sessionID': session_id,
+                        'first_interaction': timestamp,
+                        'last_interaction': timestamp,
+                        'interaction_count': 1,
+                        'latest_query': item.get('query', '')
+                    }
+                else:
+                    # Update timestamps (items are ordered by timestamp DESC)
+                    if timestamp > sessions[session_id]['last_interaction']:
+                        sessions[session_id]['last_interaction'] = timestamp
+                        sessions[session_id]['latest_query'] = item.get('query', '')
+                    if timestamp < sessions[session_id]['first_interaction']:
+                        sessions[session_id]['first_interaction'] = timestamp
+                    sessions[session_id]['interaction_count'] += 1
+            
+            # Convert to list and sort by last interaction
+            items = list(sessions.values())
+            items.sort(key=lambda x: x['last_interaction'], reverse=True)
             
             # Apply limit
             if limit:
@@ -298,31 +322,24 @@ class CosmoDBManager:
             Dict containing container statistics
         """
         try:
-            # Get total document count
-            query = "SELECT VALUE COUNT(1) FROM c"
-            total_count = list(self.container.query_items(
+            # Get all documents and calculate stats in Python to avoid CosmoDB aggregation issues
+            query = "SELECT c.sessionID, c.user_info.email FROM c WHERE c.type = 'rag_interaction'"
+            items = list(self.container.query_items(
                 query=query,
                 enable_cross_partition_query=True
-            ))[0]
+            ))
             
-            # Get unique sessions count
-            query = "SELECT VALUE COUNT(DISTINCT c.sessionID) FROM c"
-            session_count = list(self.container.query_items(
-                query=query,
-                enable_cross_partition_query=True
-            ))[0]
-            
-            # Get unique users count
-            query = "SELECT VALUE COUNT(DISTINCT c.user_info.email) FROM c WHERE IS_DEFINED(c.user_info.email)"
-            user_count = list(self.container.query_items(
-                query=query,
-                enable_cross_partition_query=True
-            ))[0]
+            # Calculate stats
+            total_count = len(items)
+            unique_sessions = len(set(item['sessionID'] for item in items))
+            unique_users = len(set(item.get('user_info', {}).get('email', 'unknown') 
+                                 for item in items 
+                                 if item.get('user_info', {}).get('email')))
             
             stats = {
                 "total_interactions": total_count,
-                "unique_sessions": session_count,
-                "unique_users": user_count,
+                "unique_sessions": unique_sessions,
+                "unique_users": unique_users,
                 "container_name": self.container_name,
                 "database_name": self.database_name,
                 "partition_key": "/sessionID"
