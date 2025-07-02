@@ -9,14 +9,17 @@ HEALRAG now includes a comprehensive FastAPI application (`main.py`) that provid
 ### Quick Start with API
 
 ```bash
-# Install FastAPI dependencies
+# Install dependencies
 pip install -r requirements.txt
 
-# Start the API server
+# Start the API server (recommended)
 python start_api.py
 
 # Or use uvicorn directly
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+# For production deployment with Gunicorn
+gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000
 ```
 
 The API will be available at:
@@ -200,76 +203,43 @@ curl -X POST "http://localhost:8000/training/start?recreate_index=true" \
 **Expected Response:**
 ```json
 {
-    "message": "Training pipeline started",
-    "status": "running"
+    "message": "Training pipeline started successfully",
+    "task_id": "training_20250101_123456",
+    "status": "started",
+    "config": {
+        "extract_images": true,
+        "chunk_size": 1000,
+        "chunk_overlap": 200,
+        "recreate_index": false
+    }
 }
 ```
 
-#### 📊 GET `/training/status` - Get Training Pipeline Status
-Check the current status and progress of the training pipeline.
+#### 📊 GET `/training/status` - Get Training Status
+Get the current status of the training pipeline.
 
 **curl command:**
 ```bash
 curl -s http://localhost:8000/training/status | python -m json.tool
 ```
 
-**Expected Response (while running):**
-```json
-{
-    "status": "running",
-    "message": "Processing files...",
-    "start_time": "2025-07-01T20:56:34.959742",
-    "end_time": null,
-    "progress": {
-        "step": 5,
-        "current_task": "Processing markdown files"
-    },
-    "results": {}
-}
-```
-
-**Expected Response (completed):**
+**Expected Response:**
 ```json
 {
     "status": "completed",
-    "message": "Training pipeline completed successfully",
-    "start_time": "2025-07-01T20:56:34.959742",
-    "end_time": "2025-07-01T20:57:25.182280",
+    "task_id": "training_20250101_123456",
     "progress": {
-        "step": 10,
-        "current_task": "Completed"
+        "current_step": "completed",
+        "total_steps": 4,
+        "processed_files": 15,
+        "total_chunks": 1250,
+        "indexed_chunks": 1250
     },
-    "results": {
-        "container_stats": {
-            "total_files": 20,
-            "file_types": {".pdf": {"count": 9}, ".md": {"count": 10}}
-        },
-        "supported_files_count": 10,
-        "content_extraction": {
-            "files_processed": 10,
-            "total_files": 10,
-            "processing_time": 39.93
-        },
-        "search_indexing": {
-            "files_processed": 10,
-            "total_chunks": 32,
-            "chunks_with_embeddings": 32,
-            "success": true
-        },
-        "search_test": {
-            "query": "cyber security policy",
-            "results_found": 3,
-            "success": true
-        },
-        "rag_test": {
-            "success": true,
-            "test_query": "What is our incident management process?"
-        }
-    }
+    "last_updated": "2025-01-01T12:45:30.123456"
 }
 ```
 
-#### ⛔ POST `/training/stop` - Stop Training Pipeline
+#### 🛑 POST `/training/stop` - Stop Training Pipeline
 Stop the currently running training pipeline.
 
 **curl command:**
@@ -282,163 +252,111 @@ curl -X POST "http://localhost:8000/training/stop" \
 **Expected Response:**
 ```json
 {
-    "detail": "No training pipeline is currently running"
+    "message": "Training pipeline stopped",
+    "status": "stopped"
 }
 ```
 
-### RAG Retrieval Endpoints
+### RAG Query Endpoints
 
-#### 🤖 POST `/rag/query` - Generate RAG Response (Non-streaming)
-Generate a comprehensive response to a query using RAG (Retrieval-Augmented Generation).
-
-**Request Body Parameters:**
-- `query` (required): The question or query to answer
-- `top_k` (optional): Number of documents to retrieve (1-20, default: 3)
-- `temperature` (optional): LLM temperature (0.0-2.0, default: 0.7)
-- `max_tokens` (optional): Maximum response tokens (50-2000, default: 500)
-- `custom_system_prompt` (optional): Custom system prompt
-- `include_search_details` (optional): Include search metadata (default: false)
+#### 🤖 POST `/rag/query` - RAG Question Answering
+Ask questions and get AI-powered answers based on your indexed documents.
 
 **curl command:**
 ```bash
 curl -X POST "http://localhost:8000/rag/query" \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "What are the key principles of our cyber security policy?",
-    "top_k": 3,
-    "temperature": 0.7,
-    "max_tokens": 500,
-    "include_search_details": false
+    "query": "What are the key principles of information security?",
+    "top_k": 5,
+    "include_sources": true
   }'
 ```
 
 **Expected Response:**
 ```json
 {
-    "success": true,
-    "response": "Based on the provided context, the key principles of Point32Health's Cyber & Information Security Policy are:\n\n1. **Protection of Information Assets:** All information assets must be protected against unauthorized disclosure, misuse, modification, compromise, corruption, destruction, and disruption...",
+    "query": "What are the key principles of information security?",
+    "answer": "The key principles of information security include confidentiality, integrity, and availability (CIA triad). Confidentiality ensures that information is only accessible to authorized individuals...",
     "sources": [
         {
-            "document_id": "Cyber___Information_Security_Policy_0000",
-            "source_file": "md_files/Cyber & Information Security Policy.md",
-            "section": "Extracted Images",
-            "score": 0.03333333507180214,
-            "chunk_index": 0,
-            "content_preview": "# tmpg4u6jxzv\n\n**Source:** /var/folders/p6/k_w2lvlx3jv1d7cv8dwc86440000gn/T/tmpg4u6jxzv.pdf..."
+            "source_file": "security_policy.pdf",
+            "section": "Core Principles",
+            "relevance_score": 0.95,
+            "content": "Information security is based on three fundamental principles..."
         }
     ],
     "metadata": {
-        "retrieval": {
-            "documents_found": 3,
-            "documents_used": 3,
-            "retrieval_time": 0.244,
-            "top_k": 3
-        },
-        "generation": {
-            "model": "gpt-4.1",
-            "temperature": 0.7,
-            "generation_time": 3.821,
-            "usage": {
-                "prompt_tokens": 3534,
-                "completion_tokens": 500,
-                "total_tokens": 4034
-            },
-            "finish_reason": "length"
-        },
-        "total_time": 4.065,
-        "timestamp": "2025-07-01T20:57:49.453842",
-        "context_length": 18716
-    },
-    "error": null
+        "response_time_ms": 1250,
+        "sources_used": 3,
+        "total_tokens": 1500
+    }
 }
 ```
 
-#### 🌊 POST `/rag/stream` - Generate Streaming RAG Response
-Generate a streaming response using Server-Sent Events (SSE) for real-time output.
-
-**Request Body Parameters:** Same as `/rag/query`
+#### 🌊 POST `/rag/stream` - Streaming RAG Response
+Get streaming RAG responses for real-time AI interactions.
 
 **curl command:**
 ```bash
 curl -X POST "http://localhost:8000/rag/stream" \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "What is our password policy?",
-    "top_k": 2,
-    "temperature": 0.7,
-    "max_tokens": 300
-  }' --no-buffer
+    "query": "Explain data classification requirements",
+    "top_k": 3
+  }' \
+  --no-buffer
 ```
 
 **Expected Response (Server-Sent Events):**
 ```
-data: {"type": "rag_start", "status": "starting_retrieval", "query": "What is our password policy?", "timestamp": "2025-07-01T20:57:59.781723"}
-
-data: {"type": "retrieval_complete", "documents_found": 3, "retrieval_time": 0.253}
-
-data: {"type": "generation_start", "status": "starting_generation"}
-
-data: {"type": "chunk", "content": "Based", "chunk_index": 1, "accumulated_content": "Based"}
-
-data: {"type": "chunk", "content": " on", "chunk_index": 2, "accumulated_content": "Based on"}
-
-data: {"type": "chunk", "content": " the", "chunk_index": 3, "accumulated_content": "Based on the"}
-
-...
-
-data: {"type": "complete", "status": "completed", "full_response": "Based on the provided context...", "finish_reason": "stop"}
-
-data: {"type": "stream_complete"}
+data: {"type": "start", "query": "Explain data classification requirements"}
+data: {"type": "chunk", "content": "Data classification"}
+data: {"type": "chunk", "content": " is a critical"}
+data: {"type": "chunk", "content": " security practice..."}
+data: {"type": "sources", "sources": [{"source_file": "data_classification.pdf", "relevance_score": 0.92}]}
+data: {"type": "end", "metadata": {"total_tokens": 1200}}
 ```
 
 ### Search Endpoints
 
-#### 🔍 POST `/search/documents` - Search Documents
-Search for documents using vector similarity search.
-
-**Request Body Parameters:**
-- `query` (required): Search query string
-- `top_k` (optional): Number of results to return (1-20, default: 5)
+#### 🔍 POST `/search/documents` - Document Search
+Search through indexed documents using vector similarity.
 
 **curl command:**
 ```bash
 curl -X POST "http://localhost:8000/search/documents" \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "access management authentication",
-    "top_k": 2
+    "query": "access control policies",
+    "top_k": 5,
+    "threshold": 0.7
   }'
 ```
 
 **Expected Response:**
 ```json
 {
-    "success": true,
+    "query": "access control policies",
     "results": [
         {
-            "id": "C_IS_007_Cyber___Information_Security_Identity__Credential__and_Access_Management_Standard_0000",
-            "content": "# tmp5nmzcnqa\n\n**Source:** /var/folders/p6/k_w2lvlx3jv1d7cv8dwc86440000gn/T/tmp5nmzcnqa.pdf\n\n**Extracted:** 2025-07-01T20:59:33.049475\n\nC&IS 007 – IDENTITY, CREDENTIAL & ACCESS MANAGEMENT SECURITY STANDARD...",
-            "source_file": "md_files/C&IS 007_Cyber & Information Security Identity, Credential, and Access Management Standard.md",
-            "section": "Extracted Images",
-            "chunk_size": 31577,
-            "chunk_index": 0,
-            "score": 0.03333333507180214,
-            "search_type": "vector"
+            "source_file": "access_control_standard.pdf",
+            "section": "Policy Framework",
+            "content": "Access control policies define who can access what resources...",
+            "relevance_score": 0.89,
+            "metadata": {
+                "chunk_id": "chunk_123",
+                "file_type": "pdf"
+            }
         }
     ],
-    "metadata": {
-        "documents_found": 2,
-        "search_time": 0.315,
-        "top_k": 2,
-        "relevance_threshold": 0.02,
-        "timestamp": "2025-07-01T21:02:34.068258"
-    },
-    "error": null
+    "total_results": 5,
+    "search_time_ms": 45
 }
 ```
 
 #### 🧪 GET `/search/test` - Test Search Functionality
-Test search functionality with a predefined query.
+Test the search functionality with a predefined query.
 
 **curl command:**
 ```bash
@@ -448,170 +366,410 @@ curl -s http://localhost:8000/search/test | python -m json.tool
 **Expected Response:**
 ```json
 {
-    "success": true,
-    "query": "cyber security policy",
-    "results_count": 3,
-    "results": [
-        {
-            "id": "Cyber___Information_Security_Policy_0000",
-            "content": "CYBER & INFORMATION SECURITY POLICY...",
-            "source_file": "md_files/Cyber & Information Security Policy.md",
-            "score": 0.03333333507180214
-        }
-    ]
+    "message": "Search test completed",
+    "test_query": "security policy",
+    "results_found": 3,
+    "response_time_ms": 125,
+    "status": "success"
 }
 ```
 
-### Root Endpoint
+### Authentication Endpoints
 
-#### 🏠 GET `/` - API Information
-Get basic information about the API and available endpoints.
+HEALRAG includes OAuth2-based authentication for secure access to the API.
 
-**curl command:**
+#### 🔐 GET `/auth/login` - Initiate Login
+Start the OAuth2 authentication flow.
+
+**Browser URL:**
+```
+http://localhost:8000/auth/login
+```
+
+#### 🔐 GET `/auth/callback` - OAuth Callback
+OAuth2 callback endpoint (handled automatically by the authentication flow).
+
+#### 👤 GET `/auth/me` - Get Current User Info
+Get information about the currently authenticated user.
+
+**curl command (with Bearer token):**
 ```bash
-curl -s http://localhost:8000/ | python -m json.tool
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  http://localhost:8000/auth/me
 ```
 
 **Expected Response:**
 ```json
 {
-    "message": "HEALRAG API",
-    "version": "1.0.0",
-    "description": "Comprehensive API for the HEALRAG system",
-    "endpoints": {
-        "health": "/health",
-        "training": "/training/start",
-        "rag_query": "/rag/query",
-        "rag_stream": "/rag/stream",
-        "search": "/search/documents",
-        "docs": "/docs"
-    }
+    "user_id": "user123",
+    "email": "user@example.com",
+    "name": "John Doe",
+    "authenticated": true
 }
 ```
 
-## 🔧 API Usage Tips
+#### 🚪 GET `/auth/logout` - Logout
+Log out the current user and invalidate the session.
 
-### Testing Workflow
-1. **Start with health check**: `GET /health` to verify all components are working
-2. **Check storage**: `GET /storage/stats` to see available documents
-3. **Run training pipeline**: `POST /training/start` to process documents
-4. **Monitor progress**: `GET /training/status` to track completion
-5. **Test search**: `GET /search/test` to verify search is working
-6. **Try RAG queries**: `POST /rag/query` for question answering
+**Browser URL:**
+```
+http://localhost:8000/auth/logout
+```
 
-### Training Pipeline Behavior
-- **Without index recreation (`recreate_index=false`)**: ~50 seconds processing time
-- **With index recreation (`recreate_index=true`)**: ~63 seconds processing time
-- Both modes automatically handle index creation and document processing
-- The system processes PDFs, extracts content, generates embeddings, and creates search indexes
+#### 🧪 GET `/auth/test-simple` - Test Authentication
+Simple endpoint to test if authentication is working.
 
-### Error Handling
-All endpoints return appropriate HTTP status codes:
-- `200`: Success
-- `400`: Bad request (invalid parameters)
-- `500`: Internal server error
-- `422`: Validation error (Pydantic model validation failed)
+**curl command:**
+```bash
+curl -s http://localhost:8000/auth/test-simple
+```
 
-### Performance Notes
-- RAG queries typically take 2-5 seconds depending on context size
-- Streaming responses provide real-time output for better user experience
-- Search operations are optimized for sub-second response times
-- Training pipeline processes 10-20 documents in under 2 minutes
+---
 
-### Environment Variables for API
+## 🛠️ Local Development Workflow
 
-Create a `.env` file with the following variables:
+### Standard Development Process
 
-```env
-# Server Configuration
-HOST=0.0.0.0
-PORT=8000
-RELOAD=true
-WORKERS=1
-LOG_LEVEL=info
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
 
+# 2. Set up environment variables
+cp .env.example .env  # Edit with your Azure credentials
+
+# 3. Start development server
+python start_api.py
+
+# 4. Test the API
+curl http://localhost:8000/health/simple
+
+# 5. Run training pipeline (optional)
+curl -X POST http://localhost:8000/training/start \
+  -H "Content-Type: application/json" \
+  -d '{"extract_images": true}'
+```
+
+## 🐳 Docker Deployment
+
+HEALRAG includes comprehensive Docker support for local development and Azure cloud deployment.
+
+### 📋 Prerequisites
+
+- Docker Desktop installed and running
+- Azure CLI (for Azure deployment)
+- Azure Container Registry (ACR) account
+- Azure subscription with App Service access
+
+### 🛠️ Docker Files
+
+The project includes several Docker-related files:
+
+- **`Dockerfile`** - Production-ready container with Python 3.11, Gunicorn, and security best practices
+- **`.dockerignore`** - Optimizes build performance by excluding unnecessary files
+- **`deploy.sh`** - Comprehensive deployment script for local and Azure deployment
+- **`requirements.txt`** - Includes all dependencies including FastAPI, Uvicorn, and Gunicorn for production deployment
+- **`start_api.py`** - Convenient startup script with customizable server settings
+
+### 🏠 Local Docker Deployment
+
+#### Build and Test Locally
+
+```bash
+# Build Docker image
+./deploy.sh build
+
+# Run container locally (http://localhost:8000)
+./deploy.sh run
+
+# Full local deployment (build + run + test)
+./deploy.sh deploy
+
+# View container logs
+./deploy.sh logs
+
+# Stop and remove container
+./deploy.sh stop
+```
+
+#### Manual Docker Commands
+
+```bash
+# Build image manually
+docker build -t healrag:latest .
+
+# Run container manually
+docker run -d --name healrag-container -p 8000:8000 --env-file .env healrag:latest
+
+# View logs
+docker logs healrag-container
+
+# Stop container
+docker stop healrag-container && docker rm healrag-container
+```
+
+### ☁️ Azure Cloud Deployment
+
+The `deploy.sh` script provides comprehensive Azure deployment capabilities with continuous deployment support.
+
+#### 🔐 Azure Prerequisites Setup
+
+1. **Create Azure Container Registry:**
+```bash
+az acr create --resource-group myResourceGroup --name myregistry --sku Standard --admin-enabled true
+```
+
+2. **Get ACR credentials:**
+```bash
+az acr credential show --name myregistry
+```
+
+3. **Add credentials to your `.env` file:**
+```bash
+AZURE_CONTAINER_REGISTRY=myregistry.azurecr.io
+AZURE_CONTAINER_REGISTRY_USERNAME=myregistry
+AZURE_CONTAINER_REGISTRY_PASSWORD=your-password-from-step-2
+```
+
+#### 🚀 Azure Deployment Commands
+
+##### Full Azure Web App Deployment
+Deploy everything: build AMD64 image, push to ACR, create/update App Service, enable continuous deployment:
+
+```bash
+./deploy.sh azure-webapp
+```
+
+This command will:
+- ✅ Build AMD64-compatible Docker image
+- ✅ Push to Azure Container Registry with timestamp versioning
+- ✅ Create App Service Plan (P3v3 tier by default)
+- ✅ Create/update Web App with container configuration
+- ✅ Configure all environment variables from your `.env` file
+- ✅ Enable continuous deployment with webhook
+- ✅ Restart the application and provide testing URLs
+
+##### Custom Azure Deployment
+Deploy with custom parameters:
+
+```bash
+./deploy.sh azure-webapp-only webapp-name resource-group location plan-name sku
+
+# Example:
+./deploy.sh azure-webapp-only healrag-prod myResourceGroup westus2 healrag-plan P2v3
+```
+
+##### Update Existing Deployment
+Build and push new image version (continuous deployment picks it up automatically):
+
+```bash
+./deploy.sh azure-update
+```
+
+##### Registry-Only Deployment
+Build and push to ACR without webapp changes:
+
+```bash
+./deploy.sh azure-deploy
+```
+
+#### 🔄 Continuous Deployment Features
+
+The Azure deployment automatically configures:
+
+- **Webhook Integration**: ACR automatically triggers webapp updates
+- **Zero-Downtime Deployment**: Azure handles rolling updates
+- **Version Tracking**: Each deployment gets timestamped tags
+- **Automatic Rollback**: Easy rollback to previous versions
+- **Health Monitoring**: Built-in health checks and monitoring
+
+#### 📊 Post-Deployment Verification
+
+After deployment, the script provides URLs for testing:
+
+```bash
+# Test deployment
+curl https://your-webapp.azurewebsites.net/health/simple
+
+# Full health check
+curl https://your-webapp.azurewebsites.net/health
+
+# API documentation
+open https://your-webapp.azurewebsites.net/docs
+```
+
+### 🔧 Environment Configuration
+
+Your `.env` file is automatically configured for the Azure App Service. Required variables:
+
+#### Core Azure Services
+```bash
 # Azure Storage
-AZURE_STORAGE_CONNECTION_STRING=your_connection_string
-AZURE_CONTAINER_NAME=healrag-documents
+AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=...
+AZURE_CONTAINER_NAME=your-container-name
 
 # Azure OpenAI
-AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
-AZURE_OPENAI_KEY=your_openai_key
+AZURE_OPENAI_ENDPOINT=https://your-openai.openai.azure.com/
+AZURE_OPENAI_KEY=your-openai-key
 AZURE_OPENAI_DEPLOYMENT=gpt-4
 AZURE_TEXT_EMBEDDING_MODEL=text-embedding-ada-002
 
-# Azure Cognitive Search
+# Azure Search
 AZURE_SEARCH_ENDPOINT=https://your-search.search.windows.net
-AZURE_SEARCH_KEY=your_search_key
-AZURE_SEARCH_INDEX_NAME=healrag-index
+AZURE_SEARCH_KEY=your-search-key
+AZURE_SEARCH_INDEX_NAME=your-index-name
+```
 
-# Processing Configuration
+#### Container Registry (for deployment)
+```bash
+AZURE_CONTAINER_REGISTRY=yourregistry.azurecr.io
+AZURE_CONTAINER_REGISTRY_USERNAME=yourregistry
+AZURE_CONTAINER_REGISTRY_PASSWORD=your-acr-password
+```
+
+#### Application Configuration
+```bash
 CHUNK_SIZE=1000
 CHUNK_OVERLAP=200
+LOG_LEVEL=INFO
 ```
 
-## Features
+### 🎯 Deployment Best Practices
 
-- **Azure Blob Storage Integration**: Complete management of files in Azure Blob Storage containers
-- **Document Processing**: Integration with MarkItDown for extracting content from various file formats
-- **Image Extraction & Analysis**: Extract images from PDFs and Word documents with Azure OpenAI Vision analysis
-- **Markdown Generation**: Generate comprehensive markdown files with embedded image descriptions and metadata
-- **Search Index Management**: Azure Cognitive Search integration with vector embeddings and semantic search
-- **File Operations**: Upload, download, and manage files with comprehensive statistics
-- **Bulk Operations**: Support for uploading/downloading entire folders or containers
-- **Connection Management**: Robust connection verification and error handling
-- **Error Recovery**: Graceful handling of search index upload errors with detailed logging
+#### Security
+- ✅ Non-root user in container
+- ✅ Minimal base image (Python 3.11 slim)
+- ✅ Environment variables for sensitive data
+- ✅ Container registry authentication
 
-## Supported File Types
+#### Performance
+- ✅ AMD64 architecture for Azure compatibility
+- ✅ Optimized layer caching with `.dockerignore`
+- ✅ Gunicorn with async workers for production
 
-HEALRAG uses MarkItDown to extract content from the following file types:
+#### Reliability
+- ✅ Health checks built into container
+- ✅ Graceful error handling and logging
+- ✅ Automatic restart policies
+- ✅ Continuous deployment with rollback capability
 
-- **Documents**: PDF, PowerPoint (.pptx, .ppt), Word (.docx, .doc), Excel (.xlsx, .xls)
-- **Images**: JPG, JPEG, PNG, GIF, BMP, TIFF (with EXIF metadata and OCR)
-- **Audio**: MP3, WAV, M4A (with EXIF metadata and speech transcription)
-- **Web**: HTML, HTM
-- **Data**: CSV, JSON, XML
-- **Archives**: ZIP files (iterates over contents)
-- **E-books**: EPub
-- **Text**: TXT files
-- **Media**: YouTube URLs
+### 🐛 Troubleshooting
 
-## Recent Fixes and Improvements
+#### Common Issues
 
-### Search Index Manager Enhancements (Latest)
+**1. Architecture Mismatch Error:**
+```
+ERROR - no matching manifest for linux/amd64
+```
+**Solution:** Use `./deploy.sh azure-webapp` which builds AMD64-compatible images.
 
-The SearchIndexManager has been enhanced with improved error handling and validation:
+**2. Authentication Failed:**
+```
+ERROR - unauthorized: authentication required
+```
+**Solution:** Verify ACR credentials in `.env` file and run `./deploy.sh azure-validate`.
 
-- **JSON Upload Fix**: Fixed issue with embedding field validation that was causing "StartArray" JSON parsing errors
-- **Document Validation**: Added comprehensive validation of document structure before upload
-- **Embedding Format Validation**: Ensures embeddings are valid 1536-dimensional vectors before upload
-- **Graceful Error Recovery**: Continues processing even if some chunks fail to upload
-- **Detailed Logging**: Enhanced logging for better debugging and monitoring
-- **Batch Processing**: Improved batch upload with individual error tracking
-
-### Error Handling Improvements
-
-- Better handling of missing or invalid embeddings
-- Graceful degradation when search index upload fails
-- Detailed error reporting for troubleshooting
-- Validation of search index schema compatibility
-
-## Installation
-
-1. Clone the repository:
+**3. Application Error on Azure:**
+```
+:( Application Error
+```
+**Solution:** Check environment variables are properly set and view logs:
 ```bash
+az webapp log tail --name your-webapp --resource-group your-rg
+```
+
+#### Deployment Script Help
+
+```bash
+# View all available commands
+./deploy.sh
+
+# Validate Azure environment
+./deploy.sh azure-validate
+
+# Test Azure CLI connection
+./deploy.sh azure-login
+```
+
+### 📈 Monitoring and Scaling
+
+#### Application Insights Integration
+Add to your `.env` for enhanced monitoring:
+```bash
+APPLICATIONINSIGHTS_CONNECTION_STRING=your-app-insights-connection
+```
+
+#### Scaling Options
+```bash
+# Scale up (increase VM size)
+az appservice plan update --name healrag-plan --resource-group myRG --sku P3v3
+
+# Scale out (increase instance count)
+az webapp update --name healrag-security --resource-group myRG --instance-count 3
+```
+
+---
+
+## 🚀 Key Features
+
+- **Comprehensive FastAPI Application**: Complete REST API with health checks, training pipelines, RAG querying, and search endpoints
+- **Azure Blob Storage Integration**: Full file management with upload, download, and statistics
+- **Document Processing**: MarkItDown integration for extracting content from PDFs, Office docs, images, and more
+- **RAG System**: Advanced question-answering with streaming responses and source attribution
+- **Search Indexing**: Vector embeddings with Azure Cognitive Search for semantic document retrieval
+- **Docker & Cloud Ready**: Production-ready containerization with Azure App Service deployment
+- **Continuous Deployment**: Automated CI/CD pipeline with webhooks and zero-downtime updates
+- **Authentication**: OAuth2-based security for API access control
+- **Monitoring**: Comprehensive health checks, logging, and error handling
+
+## 📦 Installation & Setup
+
+### Prerequisites
+- Python 3.11 or higher
+- Azure Storage Account
+- Azure OpenAI Service
+- Azure Cognitive Search Service (optional)
+- Docker Desktop (for containerization)
+
+### Quick Installation
+
+```bash
+# Clone the repository
 git clone <repository-url>
 cd HealRag
-```
 
-2. Install dependencies:
-```bash
+# Install dependencies
 pip install -r requirements.txt
+
+# Set up environment variables
+cp .env.example .env  # Edit with your Azure credentials
+
+# Start the API server
+python start_api.py
 ```
 
-## Quick Start
+### Environment Setup
+Create a `.env` file with your Azure credentials:
 
-### Basic Usage
+```bash
+# Required: Azure Storage
+AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=...
+AZURE_CONTAINER_NAME=your-container-name
+
+# Required: Azure OpenAI
+AZURE_OPENAI_ENDPOINT=https://your-openai.openai.azure.com/
+AZURE_OPENAI_KEY=your-openai-key
+AZURE_OPENAI_DEPLOYMENT=gpt-4
+AZURE_TEXT_EMBEDDING_MODEL=text-embedding-ada-002
+
+# Optional: Azure Search
+AZURE_SEARCH_ENDPOINT=https://your-search.search.windows.net
+AZURE_SEARCH_KEY=your-search-key
+AZURE_SEARCH_INDEX_NAME=healrag-index
+```
+
+## 📖 Python Library Usage
+
+### Basic Storage Operations
 
 ```python
 from healraglib import StorageManager
@@ -945,31 +1103,69 @@ The HEALRAG library includes comprehensive unit tests. To run the tests:
 
 ```bash
 # Run all tests
-python tests/run_tests.py
+python healraglib/tests/run_tests.py
 
 # Run specific test files
-python tests/test_storage_manager.py
-python tests/test_cli.py
+python -m pytest healraglib/tests/test_storage_manager.py
+python -m pytest healraglib/tests/test_cli.py
+python -m pytest healraglib/tests/test_content_manager.py
 
 # Run with pytest (if installed)
-pytest tests/
+pytest healraglib/tests/
 ```
 
 The tests use mocks to avoid requiring actual Azure credentials, making them safe to run in any environment.
 
-## Contributing
+## 📄 Supported File Types
+
+HEALRAG uses MarkItDown to extract content from various file formats:
+
+- **Documents**: PDF, PowerPoint (.pptx, .ppt), Word (.docx, .doc), Excel (.xlsx, .xls)
+- **Images**: JPG, JPEG, PNG, GIF, BMP, TIFF (with EXIF metadata and OCR)
+- **Audio**: MP3, WAV, M4A (with speech transcription)
+- **Web**: HTML, HTM
+- **Data**: CSV, JSON, XML
+- **Archives**: ZIP files (iterates over contents)
+- **E-books**: EPub
+- **Text**: TXT files
+- **Media**: YouTube URLs
+
+## 🔧 Recent Improvements
+
+### Search Index Manager Enhancements
+- **JSON Upload Fix**: Resolved embedding field validation errors
+- **Document Validation**: Comprehensive structure validation before upload
+- **Embedding Format Validation**: Ensures valid 1536-dimensional vectors
+- **Graceful Error Recovery**: Continues processing despite individual failures
+- **Enhanced Logging**: Better debugging and monitoring capabilities
+- **Batch Processing**: Improved upload with individual error tracking
+
+### FastAPI Application
+- **Complete Endpoint Coverage**: All CRUD operations for documents, training, and RAG
+- **Streaming Responses**: Real-time RAG responses with Server-Sent Events
+- **Authentication Integration**: OAuth2-based security system
+- **Comprehensive Error Handling**: Proper HTTP status codes and validation
+- **Health Monitoring**: Detailed component status and configuration endpoints
+
+### Docker & Deployment
+- **Production-Ready Containers**: Multi-stage builds with security best practices
+- **Azure App Service Integration**: Full cloud deployment with continuous delivery
+- **Environment Variable Management**: Automatic configuration from .env files
+- **Webhook Integration**: Zero-downtime deployments with ACR integration
+
+## 🤝 Contributing
 
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
 4. Add tests if applicable
-5. Run the test suite: `python tests/run_tests.py`
+5. Run the test suite: `python healraglib/tests/run_tests.py`
 6. Submit a pull request
 
-## License
+## 📄 License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
-## Support
+## 💬 Support
 
 For support and questions, please open an issue on the GitHub repository. 

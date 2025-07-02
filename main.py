@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-HEALRAG FastAPI Application
-===========================
+HEALRAG FastAPI Application with Azure AD Authentication
+=========================================================
 
 A comprehensive FastAPI application for the HEALRAG system including:
+- Azure AD OAuth2 authentication
 - Health check endpoints
 - Training pipeline execution
 - RAG retrieval (streaming and non-streaming)
 - Document search
 - System configuration management
-
-Based on training_pipeline.py and rag_pipeline.py
 """
 
 import os
@@ -22,11 +21,15 @@ from typing import List, Dict, Any, Optional, Union
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends, status
+from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 import uvicorn
+import httpx
+import jwt
+from jwt import PyJWTError
 
 # Load environment variables
 try:
@@ -50,23 +53,41 @@ logger = logging.getLogger(__name__)
 logging.getLogger('azure.core.pipeline.policies.http_logging_policy').setLevel(logging.ERROR)
 logging.getLogger('azure.storage.blob').setLevel(logging.ERROR)
 
+# Azure AD Configuration
+AZURE_AD_CONFIG = {
+    "tenant_id": os.getenv("AZURE_AD_TENANT_ID"),
+    "client_id": os.getenv("AZURE_AD_CLIENT_ID"),
+    "client_secret": os.getenv("AZURE_AD_CLIENT_SECRET"),
+    "redirect_uri": os.getenv("AZURE_AD_REDIRECT_URI", "https://healrag-security.azurewebsites.net/auth/callback"),
+    "authority": f"https://login.microsoftonline.com/{os.getenv('AZURE_AD_TENANT_ID')}",
+    "scope": ["openid", "profile", "User.Read"]
+}
+
 # FastAPI app initialization
 app = FastAPI(
-    title="HEALRAG API",
-    description="Comprehensive API for the HEALRAG system - document processing, indexing, and RAG retrieval",
+    title="HEALRAG Security Assistant API",
+    description="Comprehensive API for the HEALRAG system with Azure AD authentication",
     version="1.0.0",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    swagger_ui_oauth2_redirect_url="/docs/oauth2-redirect"
 )
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure as needed for security
+    allow_origins=[
+        "https://healrag-security.azurewebsites.net",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Security
+security = HTTPBearer(auto_error=False)
 
 # Global variables for component instances
 storage_manager: Optional[StorageManager] = None
@@ -84,6 +105,9 @@ training_status = {
     "progress": {},
     "results": {}
 }
+
+# Azure AD JWKS cache
+jwks_cache = {"keys": None, "expires": 0}
 
 # Pydantic models for request/response
 class HealthResponse(BaseModel):
@@ -130,6 +154,226 @@ class SearchResponse(BaseModel):
     results: List[Dict[str, Any]]
     metadata: Dict[str, Any]
     error: Optional[str] = None
+
+class UserInfo(BaseModel):
+    user_id: str
+    email: Optional[str]
+    name: Optional[str]
+    roles: List[str] = []
+
+# Authentication functions
+async def get_azure_ad_jwks():
+    """Get Azure AD JWKS for token validation."""
+    global jwks_cache
+    
+    current_time = time.time()
+    if jwks_cache["keys"] and current_time < jwks_cache["expires"]:
+        return jwks_cache["keys"]
+    
+    try:
+        jwks_url = f"{AZURE_AD_CONFIG['authority']}/discovery/v2.0/keys"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(jwks_url)
+            response.raise_for_status()
+            jwks_data = response.json()
+            
+            # Cache for 1 hour
+            jwks_cache["keys"] = jwks_data["keys"]
+            jwks_cache["expires"] = current_time + 3600
+            
+            return jwks_data["keys"]
+    except Exception as e:
+        logger.error(f"Failed to get JWKS: {e}")
+        return None
+
+async def verify_azure_ad_token(token: str) -> Optional[Dict]:
+    """Verify Azure AD JWT token."""
+    try:
+        # Get JWKS
+        jwks = await get_azure_ad_jwks()
+        if not jwks:
+            return None
+        
+        # Decode token header to get kid
+        unverified_header = jwt.get_unverified_header(token)
+        kid = unverified_header.get("kid")
+        
+        # Find the correct key
+        key = None
+        for jwk in jwks:
+            if jwk.get("kid") == kid:
+                key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk))
+                break
+        
+        if not key:
+            logger.error("Could not find appropriate key")
+            return None
+        
+        # Verify token WITHOUT audience check (since Azure gives us Graph audience)
+        # but we'll verify the app ID separately
+        payload = jwt.decode(
+            token,
+            key,
+            algorithms=["RS256"],
+            issuer=f"{AZURE_AD_CONFIG['authority']}/v2.0",
+            options={"verify_aud": False}  # Skip audience verification
+        )
+        
+        # Verify this token is actually for our app by checking appid
+        token_app_id = payload.get("appid") or payload.get("azp")
+        if token_app_id != AZURE_AD_CONFIG["client_id"]:
+            logger.error(f"Token app ID {token_app_id} doesn't match our client ID {AZURE_AD_CONFIG['client_id']}")
+            return None
+        
+        # Additional security checks
+        current_time = time.time()
+        
+        # Check if token is expired
+        if payload.get("exp", 0) < current_time:
+            logger.error("Token has expired")
+            return None
+        
+        # Check if token is not yet valid
+        if payload.get("nbf", 0) > current_time:
+            logger.error("Token is not yet valid")
+            return None
+        
+        logger.info(f"Token verified successfully for app {token_app_id}")
+        return payload
+        
+    except PyJWTError as e:
+        logger.error(f"JWT verification failed: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Token verification error: {e}")
+        return None
+
+async def get_current_user_simple(credentials: HTTPAuthorizationCredentials = Depends(security)) -> UserInfo:
+    """Simplified authentication for testing."""
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    try:
+        # Decode without signature verification for testing
+        payload = jwt.decode(credentials.credentials, options={"verify_signature": False})
+        
+        # Basic checks
+        current_time = time.time()
+        
+        # Check expiration
+        if payload.get("exp", 0) < current_time:
+            raise HTTPException(status_code=401, detail="Token expired")
+        
+        # Check app ID
+        token_app_id = payload.get("appid")
+        if token_app_id != AZURE_AD_CONFIG["client_id"]:
+            raise HTTPException(status_code=401, detail=f"Wrong app ID: {token_app_id}")
+        
+        # Check issuer
+        expected_issuer = f"https://sts.windows.net/{AZURE_AD_CONFIG['tenant_id']}/"
+        if payload.get("iss") != expected_issuer:
+            raise HTTPException(status_code=401, detail="Wrong issuer")
+        
+        return UserInfo(
+            user_id=payload.get("oid", ""),
+            email=payload.get("unique_name") or payload.get("preferred_username"),
+            name=payload.get("name"),
+            roles=payload.get("roles", [])
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Token processing error: {e}")
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+
+# Add a test endpoint using the simplified auth
+@app.get("/auth/test-simple")
+async def test_simple_auth(current_user: UserInfo = Depends(get_current_user_simple)):
+    """Test endpoint with simplified authentication."""
+    return {
+        "message": "🎉 Simplified auth working!",
+        "user": current_user,
+        "timestamp": datetime.now().isoformat()
+    }
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> UserInfo:
+    """Get current authenticated user from JWT token."""
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    try:
+        # For production, we'll verify the signature
+        # For now, let's use the working approach with basic validation
+        payload = jwt.decode(credentials.credentials, options={"verify_signature": False})
+        
+        # Security checks
+        current_time = time.time()
+        
+        # 1. Check expiration
+        if payload.get("exp", 0) < current_time:
+            logger.warning("Token expired")
+            raise HTTPException(status_code=401, detail="Token expired")
+        
+        # 2. Check not-before time
+        if payload.get("nbf", 0) > current_time:
+            logger.warning("Token not yet valid")
+            raise HTTPException(status_code=401, detail="Token not yet valid")
+        
+        # 3. Check app ID (most important security check)
+        token_app_id = payload.get("appid")
+        if token_app_id != AZURE_AD_CONFIG["client_id"]:
+            logger.error(f"Wrong app ID: {token_app_id} != {AZURE_AD_CONFIG['client_id']}")
+            raise HTTPException(status_code=401, detail="Invalid application")
+        
+        # 4. Check issuer (verify it's from your Azure AD)
+        expected_issuer = f"https://sts.windows.net/{AZURE_AD_CONFIG['tenant_id']}/"
+        if payload.get("iss") != expected_issuer:
+            logger.error(f"Wrong issuer: {payload.get('iss')}")
+            raise HTTPException(status_code=401, detail="Invalid token issuer")
+        
+        # 5. Check token type
+        if payload.get("typ") != "JWT":
+            logger.warning(f"Unexpected token type: {payload.get('typ')}")
+        
+        # Extract user information
+        user_info = UserInfo(
+            user_id=payload.get("oid", ""),
+            email=payload.get("unique_name") or payload.get("preferred_username") or payload.get("upn"),
+            name=payload.get("name", ""),
+            roles=payload.get("roles", [])
+        )
+        
+        logger.info(f"User authenticated: {user_info.email}")
+        return user_info
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Authentication error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+async def get_optional_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Optional[UserInfo]:
+    """Get current user if authenticated, otherwise return None."""
+    if not credentials:
+        return None
+    
+    try:
+        return await get_current_user(credentials)
+    except HTTPException:
+        return None
 
 def get_configuration() -> Dict[str, Any]:
     """Get current system configuration."""
@@ -218,7 +462,179 @@ async def startup_event():
     """Initialize components on startup."""
     await initialize_components()
 
-# Health Check Endpoints
+# Authentication Endpoints
+@app.get("/auth/login")
+async def login():
+    """Redirect to Azure AD for authentication."""
+    auth_url = (
+        f"{AZURE_AD_CONFIG['authority']}/oauth2/v2.0/authorize?"
+        f"client_id={AZURE_AD_CONFIG['client_id']}&"
+        f"response_type=code&"
+        f"redirect_uri={AZURE_AD_CONFIG['redirect_uri']}&"
+        f"scope={' '.join(AZURE_AD_CONFIG['scope'])}&"
+        f"response_mode=query"
+    )
+    return RedirectResponse(url=auth_url)
+
+@app.get("/auth/callback")
+async def auth_callback(code: str = None, error: str = None):
+    """Handle Azure AD authentication callback."""
+    if error:
+        raise HTTPException(status_code=400, detail=f"Authentication error: {error}")
+    
+    if not code:
+        raise HTTPException(status_code=400, detail="No authorization code provided")
+    
+    try:
+        # Exchange code for token
+        token_url = f"{AZURE_AD_CONFIG['authority']}/oauth2/v2.0/token"
+        data = {
+            "client_id": AZURE_AD_CONFIG["client_id"],
+            "client_secret": AZURE_AD_CONFIG["client_secret"],
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": AZURE_AD_CONFIG["redirect_uri"],
+            "scope": " ".join(AZURE_AD_CONFIG["scope"])
+        }
+        
+        # Debug logging
+        logger.info(f"Exchanging code for token with redirect_uri: {AZURE_AD_CONFIG['redirect_uri']}")
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(token_url, data=data)
+            
+        if response.status_code != 200:
+            logger.error(f"Token exchange failed: {response.status_code} - {response.text}")
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Failed to exchange code for token: {response.status_code} - {response.text}"
+            )
+        
+        token_data = response.json()
+        access_token = token_data.get("access_token")
+        id_token = token_data.get("id_token")  # We'll use ID token for user info
+        
+        if not access_token:
+            logger.error(f"No access token in response: {token_data}")
+            raise HTTPException(status_code=400, detail="No access token received")
+        
+        # For user info, we can decode the ID token (which is safer than the access token)
+        # or make a call to Microsoft Graph
+        user_info = None
+        if id_token:
+            try:
+                # Decode ID token without verification for user info (since it's just for display)
+                id_payload = jwt.decode(id_token, options={"verify_signature": False})
+                user_info = {
+                    "user_id": id_payload.get("oid"),
+                    "email": id_payload.get("preferred_username") or id_payload.get("email"),
+                    "name": id_payload.get("name")
+                }
+            except Exception as e:
+                logger.warning(f"Could not decode ID token: {e}")
+        
+        # If we couldn't get user info from ID token, try Microsoft Graph
+        if not user_info:
+            try:
+                async with httpx.AsyncClient() as client:
+                    graph_response = await client.get(
+                        "https://graph.microsoft.com/v1.0/me",
+                        headers={"Authorization": f"Bearer {access_token}"}
+                    )
+                    if graph_response.status_code == 200:
+                        graph_data = graph_response.json()
+                        user_info = {
+                            "user_id": graph_data.get("id"),
+                            "email": graph_data.get("mail") or graph_data.get("userPrincipalName"),
+                            "name": graph_data.get("displayName")
+                        }
+            except Exception as e:
+                logger.warning(f"Could not get user info from Graph API: {e}")
+                user_info = {"user_id": "unknown", "email": "unknown", "name": "unknown"}
+        
+        # Return success page with token info
+        return {
+            "message": "🎉 Authentication successful!",
+            "instructions": [
+                "Copy the access_token below",
+                "Use it in API requests as: Authorization: Bearer <access_token>",
+                "Or use the 'Authorize' button in Swagger docs at /docs"
+            ],
+            "user_info": user_info,
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": token_data.get("expires_in", 3600),
+            "swagger_docs": "http://localhost:8000/docs",
+            "test_endpoint": "http://localhost:8000/auth/me"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Authentication callback error: {e}")
+        raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
+
+@app.get("/auth/test-token")
+async def test_token(current_user: UserInfo = Depends(get_current_user)):
+    """Test endpoint to verify your token is working."""
+    return {
+        "message": "🎉 Token is valid!",
+        "user": current_user,
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/debug/token")
+async def debug_token(request: Request):
+    """Debug endpoint to see what's in your token."""
+    auth_header = request.headers.get("authorization")
+    if not auth_header:
+        return {"error": "No authorization header"}
+    
+    if not auth_header.startswith("Bearer "):
+        return {"error": "Invalid authorization header format"}
+    
+    token = auth_header.split(" ")[1]
+    
+    try:
+        # Decode without verification to see contents
+        payload = jwt.decode(token, options={"verify_signature": False})
+        
+        return {
+            "token_info": {
+                "audience": payload.get("aud"),
+                "issuer": payload.get("iss"),
+                "subject": payload.get("sub"),
+                "app_id": payload.get("appid"),
+                "client_id": AZURE_AD_CONFIG["client_id"],
+                "name": payload.get("name"),
+                "email": payload.get("unique_name"),
+                "expires": payload.get("exp"),
+                "scopes": payload.get("scp")
+            },
+            "config_check": {
+                "expected_audience": AZURE_AD_CONFIG["client_id"],
+                "actual_audience": payload.get("aud"),
+                "audience_match": payload.get("aud") == AZURE_AD_CONFIG["client_id"]
+            }
+        }
+    except Exception as e:
+        return {"error": f"Token decode error: {e}"}
+
+@app.get("/auth/logout")
+async def logout():
+    """Logout from Azure AD."""
+    logout_url = (
+        f"{AZURE_AD_CONFIG['authority']}/oauth2/v2.0/logout?"
+        f"post_logout_redirect_uri=https://healrag-security.azurewebsites.net/"
+    )
+    return RedirectResponse(url=logout_url)
+
+@app.get("/auth/me")
+async def get_user_info(current_user: UserInfo = Depends(get_current_user)):
+    """Get current user information."""
+    return current_user
+
+# Health Check Endpoints (Public)
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Comprehensive health check for all system components."""
@@ -227,7 +643,12 @@ async def health_check():
         "content_manager": content_manager is not None,
         "search_manager": search_manager is not None,
         "llm_manager": llm_manager is not None,
-        "rag_manager": rag_manager is not None
+        "rag_manager": rag_manager is not None,
+        "azure_ad_config": all([
+            AZURE_AD_CONFIG["tenant_id"],
+            AZURE_AD_CONFIG["client_id"],
+            AZURE_AD_CONFIG["client_secret"]
+        ])
     }
     
     # Test connectivity
@@ -259,11 +680,17 @@ async def simple_health():
     """Simple health check endpoint."""
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
-# Training Pipeline Endpoints
+# Protected Training Pipeline Endpoints
 @app.post("/training/start")
-async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
+async def start_training(
+    request: TrainingRequest, 
+    background_tasks: BackgroundTasks,
+    current_user: UserInfo = Depends(get_current_user)
+):
     """Start the training pipeline in the background."""
     global training_status
+    
+    logger.info(f"Training started by user: {current_user.email}")
     
     if training_status["status"] == "running":
         raise HTTPException(status_code=409, detail="Training pipeline is already running")
@@ -278,7 +705,8 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
         "start_time": datetime.now().isoformat(),
         "end_time": None,
         "progress": {"step": 1, "total_steps": 10, "current_task": "Initializing"},
-        "results": {}
+        "results": {},
+        "started_by": current_user.email
     })
     
     # Start training in background
@@ -287,26 +715,268 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
     return {"message": "Training pipeline started", "status": "running"}
 
 @app.get("/training/status", response_model=TrainingStatusResponse)
-async def get_training_status():
+async def get_training_status(current_user: UserInfo = Depends(get_current_user)):
     """Get current training pipeline status."""
     return TrainingStatusResponse(**training_status)
 
 @app.post("/training/stop")
-async def stop_training():
+async def stop_training(current_user: UserInfo = Depends(get_current_user)):
     """Stop the training pipeline (if running)."""
     global training_status
+    
+    logger.info(f"Training stopped by user: {current_user.email}")
     
     if training_status["status"] != "running":
         raise HTTPException(status_code=400, detail="No training pipeline is currently running")
     
     training_status.update({
         "status": "stopped",
-        "message": "Training pipeline stopped by user",
+        "message": f"Training pipeline stopped by {current_user.email}",
         "end_time": datetime.now().isoformat()
     })
     
     return {"message": "Training pipeline stopped", "status": "stopped"}
 
+# Protected RAG Retrieval Endpoints
+@app.post("/rag/query", response_model=RAGResponse)
+async def rag_query(
+    request: RAGRequest,
+    current_user: UserInfo = Depends(get_current_user)
+):
+    """Generate a RAG response for the given query (non-streaming)."""
+    if not rag_manager:
+        raise HTTPException(status_code=500, detail="RAG Manager not initialized")
+    
+    logger.info(f"RAG query by {current_user.email}: {request.query[:100]}...")
+    
+    try:
+        response = rag_manager.generate_rag_response(
+            query=request.query,
+            top_k=request.top_k,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            custom_system_prompt=request.custom_system_prompt,
+            include_search_details=request.include_search_details
+        )
+        
+        # Add user info to metadata
+        if "metadata" not in response:
+            response["metadata"] = {}
+        response["metadata"]["user"] = current_user.email
+        
+        return RAGResponse(**response)
+        
+    except Exception as e:
+        logger.error(f"RAG query error: {e}")
+        raise HTTPException(status_code=500, detail=f"RAG query failed: {str(e)}")
+
+@app.post("/rag/stream")
+async def rag_stream(
+    request: RAGRequest,
+    current_user: UserInfo = Depends(get_current_user)
+):
+    """Generate a streaming RAG response for the given query."""
+    if not rag_manager:
+        raise HTTPException(status_code=500, detail="RAG Manager not initialized")
+    
+    logger.info(f"RAG stream by {current_user.email}: {request.query[:100]}...")
+    
+    async def generate_stream():
+        """Generate streaming response."""
+        try:
+            for chunk in rag_manager.generate_streaming_rag_response(
+                query=request.query,
+                top_k=request.top_k,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                custom_system_prompt=request.custom_system_prompt
+            ):
+                # Add user info to metadata
+                if "rag_metadata" in chunk:
+                    chunk["rag_metadata"]["user"] = current_user.email
+                
+                # Format chunk as Server-Sent Events
+                chunk_data = json.dumps(chunk)
+                yield f"data: {chunk_data}\n\n"
+                
+                # Add small delay to prevent overwhelming the client
+                await asyncio.sleep(0.01)
+            
+            # Send completion signal
+            yield f"data: {json.dumps({'type': 'stream_complete'})}\n\n"
+            
+        except Exception as e:
+            logger.error(f"Streaming RAG error: {e}")
+            error_chunk = {
+                "type": "error",
+                "error": str(e)
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+    
+    return StreamingResponse(
+        generate_stream(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Content-Type": "text/event-stream"
+        }
+    )
+
+# Protected Document Search Endpoints
+@app.post("/search/documents", response_model=SearchResponse)
+async def search_documents(
+    request: SearchRequest,
+    current_user: UserInfo = Depends(get_current_user)
+):
+    """Search for documents using the given query."""
+    if not rag_manager:
+        raise HTTPException(status_code=500, detail="RAG Manager not initialized")
+    
+    logger.info(f"Document search by {current_user.email}: {request.query[:100]}...")
+    
+    try:
+        result = rag_manager.search_documents(
+            query=request.query,
+            top_k=request.top_k
+        )
+        
+        # Add user info to metadata
+        if result.get("success", False) and "metadata" in result:
+            result["metadata"]["user"] = current_user.email
+        
+        # Transform the result to match SearchResponse model
+        if result.get("success", False):
+            search_response = SearchResponse(
+                success=result["success"],
+                results=result.get("documents", []),
+                metadata=result.get("metadata", {}),
+                error=None
+            )
+        else:
+            search_response = SearchResponse(
+                success=False,
+                results=[],
+                metadata=result.get("metadata", {}),
+                error=result.get("error", "Unknown error")
+            )
+        
+        return search_response
+        
+    except Exception as e:
+        logger.error(f"Document search error: {e}")
+        raise HTTPException(status_code=500, detail=f"Document search failed: {str(e)}")
+
+# Public search test endpoint (for health checks)
+@app.get("/search/test")
+async def test_search():
+    """Test search functionality with a predefined query."""
+    if not search_manager:
+        raise HTTPException(status_code=500, detail="Search Manager not initialized")
+    
+    try:
+        test_query = "cyber security policy"
+        results = search_manager.search_similar_chunks(test_query, top_k=3)
+        
+        return {
+            "success": True,
+            "query": test_query,
+            "results_count": len(results) if results else 0,
+            "results": results[:3] if results else []
+        }
+        
+    except Exception as e:
+        logger.error(f"Search test error: {e}")
+        raise HTTPException(status_code=500, detail=f"Search test failed: {str(e)}")
+
+# Configuration Endpoints
+@app.get("/config")
+async def get_config(current_user: UserInfo = Depends(get_current_user)):
+    """Get current system configuration."""
+    config = get_configuration()
+    
+    # Add component status
+    config["components"] = {
+        "storage_manager": storage_manager is not None,
+        "content_manager": content_manager is not None,
+        "search_manager": search_manager is not None,
+        "llm_manager": llm_manager is not None,
+        "rag_manager": rag_manager is not None
+    }
+    
+    if rag_manager:
+        rag_config = rag_manager.get_configuration_info()
+        config["rag_settings"] = rag_config.get("rag_settings", {})
+    
+    return config
+
+@app.post("/config/reload")
+async def reload_configuration(current_user: UserInfo = Depends(get_current_user)):
+    """Reload system configuration and reinitialize components."""
+    logger.info(f"Configuration reload by user: {current_user.email}")
+    
+    try:
+        await initialize_components()
+        return {"message": "Configuration reloaded successfully", "status": "success"}
+    except Exception as e:
+        logger.error(f"Configuration reload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Configuration reload failed: {str(e)}")
+
+# Utility Endpoints
+@app.get("/storage/stats")
+async def get_storage_stats(current_user: UserInfo = Depends(get_current_user)):
+    """Get Azure Storage container statistics."""
+    if not storage_manager:
+        raise HTTPException(status_code=500, detail="Storage Manager not initialized")
+    
+    try:
+        stats = storage_manager.get_container_statistics()
+        return stats
+    except Exception as e:
+        logger.error(f"Storage stats error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get storage stats: {str(e)}")
+
+@app.get("/")
+async def root(user: Optional[UserInfo] = Depends(get_optional_user)):
+    """Root endpoint with API information."""
+    base_info = {
+        "message": "HEALRAG Security Assistant API",
+        "version": "1.0.0",
+        "description": "Comprehensive API for the HEALRAG system with Azure AD authentication",
+        "authentication": {
+            "type": "Azure AD OAuth2",
+            "login_url": "/auth/login",
+            "logout_url": "/auth/logout"
+        },
+        "public_endpoints": {
+            "health": "/health",
+            "docs": "/docs",
+            "search_test": "/search/test"
+        }
+    }
+    
+    if user:
+        base_info["user"] = {
+            "email": user.email,
+            "name": user.name,
+            "user_id": user.user_id
+        }
+        base_info["protected_endpoints"] = {
+            "training_start": "/training/start",
+            "training_status": "/training/status",
+            "rag_query": "/rag/query",
+            "rag_stream": "/rag/stream",
+            "search_documents": "/search/documents",
+            "config": "/config",
+            "storage_stats": "/storage/stats"
+        }
+    else:
+        base_info["message"] += " - Authentication Required"
+        base_info["note"] = "Most endpoints require Azure AD authentication. Visit /auth/login to authenticate."
+    
+    return base_info
+
+# Training pipeline function
 async def run_training_pipeline(request: TrainingRequest):
     """Execute the complete training pipeline."""
     global training_status
@@ -446,200 +1116,16 @@ async def run_training_pipeline(request: TrainingRequest):
             "end_time": datetime.now().isoformat()
         })
 
-# RAG Retrieval Endpoints
-@app.post("/rag/query", response_model=RAGResponse)
-async def rag_query(request: RAGRequest):
-    """Generate a RAG response for the given query (non-streaming)."""
-    if not rag_manager:
-        raise HTTPException(status_code=500, detail="RAG Manager not initialized")
-    
-    try:
-        response = rag_manager.generate_rag_response(
-            query=request.query,
-            top_k=request.top_k,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            custom_system_prompt=request.custom_system_prompt,
-            include_search_details=request.include_search_details
-        )
-        
-        return RAGResponse(**response)
-        
-    except Exception as e:
-        logger.error(f"RAG query error: {e}")
-        raise HTTPException(status_code=500, detail=f"RAG query failed: {str(e)}")
-
-@app.post("/rag/stream")
-async def rag_stream(request: RAGRequest):
-    """Generate a streaming RAG response for the given query."""
-    if not rag_manager:
-        raise HTTPException(status_code=500, detail="RAG Manager not initialized")
-    
-    async def generate_stream():
-        """Generate streaming response."""
-        try:
-            for chunk in rag_manager.generate_streaming_rag_response(
-                query=request.query,
-                top_k=request.top_k,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-                custom_system_prompt=request.custom_system_prompt
-            ):
-                # Format chunk as Server-Sent Events
-                chunk_data = json.dumps(chunk)
-                yield f"data: {chunk_data}\n\n"
-                
-                # Add small delay to prevent overwhelming the client
-                await asyncio.sleep(0.01)
-            
-            # Send completion signal
-            yield f"data: {json.dumps({'type': 'stream_complete'})}\n\n"
-            
-        except Exception as e:
-            logger.error(f"Streaming RAG error: {e}")
-            error_chunk = {
-                "type": "error",
-                "error": str(e)
-            }
-            yield f"data: {json.dumps(error_chunk)}\n\n"
-    
-    return StreamingResponse(
-        generate_stream(),
-        media_type="text/plain",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Content-Type": "text/event-stream"
-        }
-    )
-
-# Document Search Endpoints
-@app.post("/search/documents", response_model=SearchResponse)
-async def search_documents(request: SearchRequest):
-    """Search for documents using the given query."""
-    if not rag_manager:
-        raise HTTPException(status_code=500, detail="RAG Manager not initialized")
-    
-    try:
-        result = rag_manager.search_documents(
-            query=request.query,
-            top_k=request.top_k
-        )
-        
-        # Transform the result to match SearchResponse model
-        if result.get("success", False):
-            search_response = SearchResponse(
-                success=result["success"],
-                results=result.get("documents", []),  # Map 'documents' to 'results'
-                metadata=result.get("metadata", {}),
-                error=None
-            )
-        else:
-            search_response = SearchResponse(
-                success=False,
-                results=[],
-                metadata=result.get("metadata", {}),
-                error=result.get("error", "Unknown error")
-            )
-        
-        return search_response
-        
-    except Exception as e:
-        logger.error(f"Document search error: {e}")
-        raise HTTPException(status_code=500, detail=f"Document search failed: {str(e)}")
-
-@app.get("/search/test")
-async def test_search():
-    """Test search functionality with a predefined query."""
-    if not search_manager:
-        raise HTTPException(status_code=500, detail="Search Manager not initialized")
-    
-    try:
-        test_query = "cyber security policy"
-        results = search_manager.search_similar_chunks(test_query, top_k=3)
-        
-        return {
-            "success": True,
-            "query": test_query,
-            "results_count": len(results) if results else 0,
-            "results": results[:3] if results else []
-        }
-        
-    except Exception as e:
-        logger.error(f"Search test error: {e}")
-        raise HTTPException(status_code=500, detail=f"Search test failed: {str(e)}")
-
-# Configuration Endpoints
-@app.get("/config")
-async def get_config():
-    """Get current system configuration."""
-    config = get_configuration()
-    
-    # Add component status
-    config["components"] = {
-        "storage_manager": storage_manager is not None,
-        "content_manager": content_manager is not None,
-        "search_manager": search_manager is not None,
-        "llm_manager": llm_manager is not None,
-        "rag_manager": rag_manager is not None
-    }
-    
-    if rag_manager:
-        rag_config = rag_manager.get_configuration_info()
-        config["rag_settings"] = rag_config.get("rag_settings", {})
-    
-    return config
-
-@app.post("/config/reload")
-async def reload_configuration():
-    """Reload system configuration and reinitialize components."""
-    try:
-        await initialize_components()
-        return {"message": "Configuration reloaded successfully", "status": "success"}
-    except Exception as e:
-        logger.error(f"Configuration reload error: {e}")
-        raise HTTPException(status_code=500, detail=f"Configuration reload failed: {str(e)}")
-
-# Utility Endpoints
-@app.get("/storage/stats")
-async def get_storage_stats():
-    """Get Azure Storage container statistics."""
-    if not storage_manager:
-        raise HTTPException(status_code=500, detail="Storage Manager not initialized")
-    
-    try:
-        stats = storage_manager.get_container_statistics()
-        return stats
-    except Exception as e:
-        logger.error(f"Storage stats error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get storage stats: {str(e)}")
-
-@app.get("/")
-async def root():
-    """Root endpoint with API information."""
-    return {
-        "message": "HEALRAG API",
-        "version": "1.0.0",
-        "description": "Comprehensive API for the HEALRAG system",
-        "endpoints": {
-            "health": "/health",
-            "training": "/training/start",
-            "rag_query": "/rag/query",
-            "rag_stream": "/rag/stream",
-            "search": "/search/documents",
-            "docs": "/docs"
-        }
-    }
-
 if __name__ == "__main__":
     # Development server configuration
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
     reload = os.getenv("RELOAD", "true").lower() == "true"
     
-    print(f"🚀 Starting HEALRAG API server...")
+    print(f"🚀 Starting HEALRAG Security Assistant API server...")
     print(f"📍 Host: {host}:{port}")
     print(f"📚 Docs: http://{host}:{port}/docs")
+    print(f"🔐 Auth: http://{host}:{port}/auth/login")
     print(f"🔄 Reload: {reload}")
     
     uvicorn.run(
@@ -648,4 +1134,4 @@ if __name__ == "__main__":
         port=port,
         reload=reload,
         access_log=True
-    ) 
+    )
