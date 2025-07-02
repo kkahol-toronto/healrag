@@ -1193,8 +1193,12 @@ async def get_cosmo_stats(current_user: UserInfo = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=f"Failed to get CosmoDB stats: {str(e)}")
 
 @app.get("/")
-async def root(user: Optional[UserInfo] = Depends(get_optional_user)):
+async def root(request: Request, user: Optional[UserInfo] = Depends(get_optional_user)):
     """Root endpoint with API information."""
+    # Check if there's a token in the query parameters
+    token = request.query_params.get("token")
+    expires_in = request.query_params.get("expires_in")
+    
     base_info = {
         "message": "HEALRAG Security Assistant API",
         "version": "1.0.0",
@@ -1210,6 +1214,20 @@ async def root(user: Optional[UserInfo] = Depends(get_optional_user)):
             "search_test": "/search/test"
         }
     }
+    
+    # If token is present in URL, show it for easy copying
+    if token:
+        base_info["🎉 SUCCESS"] = "Authentication completed! Copy the token below:"
+        base_info["📋 ACCESS_TOKEN"] = token
+        base_info["⏰ EXPIRES_IN"] = f"{expires_in} seconds" if expires_in else "Unknown"
+        base_info["📖 USAGE_INSTRUCTIONS"] = {
+            "1": "Copy the ACCESS_TOKEN above",
+            "2": "Go to /docs (Swagger UI)",
+            "3": "Click 'Authorize' button (🔒)",
+            "4": f"Enter: Bearer {token[:50]}...",
+            "5": "Now you can test all protected endpoints!"
+        }
+        base_info["🔗 SWAGGER_URL"] = "/docs"
     
     if user:
         base_info["user"] = {
@@ -1227,8 +1245,9 @@ async def root(user: Optional[UserInfo] = Depends(get_optional_user)):
             "storage_stats": "/storage/stats"
         }
     else:
-        base_info["message"] += " - Authentication Required"
-        base_info["note"] = "Most endpoints require Azure AD authentication. Visit /auth/login to authenticate."
+        if not token:  # Only show auth required if no token in URL
+            base_info["message"] += " - Authentication Required"
+            base_info["note"] = "Most endpoints require Azure AD authentication. Visit /auth/login to authenticate."
     
     return base_info
 
