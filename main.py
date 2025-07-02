@@ -79,7 +79,9 @@ app.add_middleware(
     allow_origins=[
         "https://healrag-security.azurewebsites.net",
         "http://localhost:8000",
-        "http://127.0.0.1:8000"
+        "http://127.0.0.1:8000",
+        "http://localhost:3000",      # Add this for frontend dev
+        "http://127.0.0.1:3000"       # Add this for frontend dev
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -498,8 +500,15 @@ async def startup_event():
 
 # Authentication Endpoints
 @app.get("/auth/login")
-async def login():
+async def login(redirect_uri: Optional[str] = None):
     """Redirect to Azure AD for authentication."""
+    # Store redirect_uri in session or pass it through state parameter
+    state = ""
+    if redirect_uri:
+        # Base64 encode the redirect_uri to pass it safely
+        import base64
+        state = base64.b64encode(redirect_uri.encode()).decode()
+    
     auth_url = (
         f"{AZURE_AD_CONFIG['authority']}/oauth2/v2.0/authorize?"
         f"client_id={AZURE_AD_CONFIG['client_id']}&"
@@ -508,10 +517,14 @@ async def login():
         f"scope={' '.join(AZURE_AD_CONFIG['scope'])}&"
         f"response_mode=query"
     )
+    
+    if state:
+        auth_url += f"&state={state}"
+    
     return RedirectResponse(url=auth_url)
 
 @app.get("/auth/callback")
-async def auth_callback(code: str = None, error: str = None):
+async def auth_callback(code: str = None, error: str = None, state: str = None):
     """Handle Azure AD authentication callback."""
     if error:
         raise HTTPException(status_code=400, detail=f"Authentication error: {error}")
@@ -520,7 +533,7 @@ async def auth_callback(code: str = None, error: str = None):
         raise HTTPException(status_code=400, detail="No authorization code provided")
     
     try:
-        # Exchange code for token
+        # Exchange code for token (existing code...)
         token_url = f"{AZURE_AD_CONFIG['authority']}/oauth2/v2.0/token"
         data = {
             "client_id": AZURE_AD_CONFIG["client_id"],
@@ -531,76 +544,39 @@ async def auth_callback(code: str = None, error: str = None):
             "scope": " ".join(AZURE_AD_CONFIG["scope"])
         }
         
-        # Debug logging
-        logger.info(f"Exchanging code for token with redirect_uri: {AZURE_AD_CONFIG['redirect_uri']}")
-        
         async with httpx.AsyncClient() as client:
             response = await client.post(token_url, data=data)
             
         if response.status_code != 200:
             logger.error(f"Token exchange failed: {response.status_code} - {response.text}")
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Failed to exchange code for token: {response.status_code} - {response.text}"
-            )
+            raise HTTPException(status_code=400, detail="Token exchange failed")
         
         token_data = response.json()
         access_token = token_data.get("access_token")
-        id_token = token_data.get("id_token")  # We'll use ID token for user info
         
-        if not access_token:
-            logger.error(f"No access token in response: {token_data}")
-            raise HTTPException(status_code=400, detail="No access token received")
-        
-        # For user info, we can decode the ID token (which is safer than the access token)
-        # or make a call to Microsoft Graph
-        user_info = None
-        if id_token:
+        # Decode redirect_uri from state parameter
+        redirect_url = "https://healrag-security.azurewebsites.net"  # default
+        if state:
             try:
-                # Decode ID token without verification for user info (since it's just for display)
-                id_payload = jwt.decode(id_token, options={"verify_signature": False})
-                user_info = {
-                    "user_id": id_payload.get("oid"),
-                    "email": id_payload.get("preferred_username") or id_payload.get("email"),
-                    "name": id_payload.get("name")
-                }
-            except Exception as e:
-                logger.warning(f"Could not decode ID token: {e}")
+                import base64
+                redirect_url = base64.b64decode(state.encode()).decode()
+            except:
+                pass
         
-        # If we couldn't get user info from ID token, try Microsoft Graph
-        if not user_info:
-            try:
-                async with httpx.AsyncClient() as client:
-                    graph_response = await client.get(
-                        "https://graph.microsoft.com/v1.0/me",
-                        headers={"Authorization": f"Bearer {access_token}"}
-                    )
-                    if graph_response.status_code == 200:
-                        graph_data = graph_response.json()
-                        user_info = {
-                            "user_id": graph_data.get("id"),
-                            "email": graph_data.get("mail") or graph_data.get("userPrincipalName"),
-                            "name": graph_data.get("displayName")
-                        }
-            except Exception as e:
-                logger.warning(f"Could not get user info from Graph API: {e}")
-                user_info = {"user_id": "unknown", "email": "unknown", "name": "unknown"}
+        # Option 1: Redirect back to frontend with token in URL (less secure)
+        return RedirectResponse(url=f"{redirect_url}?token={access_token}&expires_in={token_data.get('expires_in', 3600)}")
         
-        # Return success page with token info
-        return {
-            "message": "🎉 Authentication successful!",
-            "instructions": [
-                "Copy the access_token below",
-                "Use it in API requests as: Authorization: Bearer <access_token>",
-                "Or use the 'Authorize' button in Swagger docs at /docs"
-            ],
-            "user_info": user_info,
-            "access_token": access_token,
-            "token_type": "bearer",
-            "expires_in": token_data.get("expires_in", 3600),
-            "swagger_docs": "http://localhost:8000/docs",
-            "test_endpoint": "http://localhost:8000/auth/me"
-        }
+        # Option 2: Set httpOnly cookies and redirect (more secure)
+        # response = RedirectResponse(url=redirect_url)
+        # response.set_cookie(
+        #     key="access_token", 
+        #     value=access_token, 
+        #     httponly=True, 
+        #     secure=True, 
+        #     samesite="lax",
+        #     max_age=token_data.get('expires_in', 3600)
+        # )
+        # return response
         
     except HTTPException:
         raise
@@ -655,11 +631,12 @@ async def debug_token(request: Request):
         return {"error": f"Token decode error: {e}"}
 
 @app.get("/auth/logout")
-async def logout():
+async def logout(redirect_uri: Optional[str] = None):
     """Logout from Azure AD."""
+    post_logout_redirect = redirect_uri or "https://healrag-security.azurewebsites.net/"
     logout_url = (
         f"{AZURE_AD_CONFIG['authority']}/oauth2/v2.0/logout?"
-        f"post_logout_redirect_uri=https://healrag-security.azurewebsites.net/"
+        f"post_logout_redirect_uri={post_logout_redirect}"
     )
     return RedirectResponse(url=logout_url)
 
@@ -1044,7 +1021,7 @@ async def test_search():
 
 # Configuration Endpoints
 @app.get("/config")
-async def get_config(current_user: UserInfo = Depends(get_current_user)):
+async def get_config():
     """Get current system configuration."""
     config = get_configuration()
     
