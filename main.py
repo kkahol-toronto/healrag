@@ -81,7 +81,8 @@ app.add_middleware(
         "http://localhost:8000",
         "http://127.0.0.1:8000",
         "http://localhost:3000",      # Add this for frontend dev
-        "http://127.0.0.1:3000"       # Add this for frontend dev
+        "http://127.0.0.1:3000",
+        "https://blue-dune-0ef76e10f2.azurestaticapps.net"       # Add this for frontend dev
     ],
     allow_credentials=True,
     allow_methods=["*"],
