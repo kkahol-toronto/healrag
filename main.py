@@ -30,6 +30,8 @@ import uvicorn
 import httpx
 import jwt
 from jwt import PyJWTError
+from azure.storage.blob import BlobServiceClient
+import urllib.parse
 
 # Load environment variables
 try:
@@ -148,11 +150,10 @@ class SearchRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=20, description="Number of results to return")
 
 class RAGResponse(BaseModel):
-    success: bool
-    response: str
-    sources: List[Dict[str, Any]]
-    metadata: Dict[str, Any]
-    error: Optional[str] = None
+    message: Dict[str, str]  # {"content": "response text", "role": "assistant"}
+    context: Dict[str, Any]  # {"data_points": [...], "followup_questions": None, "thoughts": [...]}
+    sources: List[Dict[str, Any]]  # [{"title": "...", "content": "...", "source": "...", "chunk_id": "...", "score": ...}]
+    session_state: str  # session_id
 
 class SearchResponse(BaseModel):
     success: bool
@@ -752,6 +753,41 @@ async def stop_training(current_user: UserInfo = Depends(get_current_user)):
     
     return {"message": "Training pipeline stopped", "status": "stopped"}
 
+# Add test endpoint for new format (no auth required)
+@app.post("/test/rag/query")
+async def test_rag_query_no_auth(request: RAGRequest):
+    """Test RAG query endpoint without authentication for testing the new format."""
+    if not rag_manager:
+        raise HTTPException(status_code=500, detail="RAG Manager not initialized")
+    
+    logger.info(f"Test RAG query: {request.query[:100]}...")
+    
+    try:
+        response = rag_manager.generate_rag_response(
+            query=request.query,
+            top_k=request.top_k,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            custom_system_prompt=request.custom_system_prompt,
+            include_search_details=request.include_search_details,
+            conversation_history=[],  # No history for test
+            session_id=request.session_id
+        )
+        
+        # Extract only the fields needed for the new RAGResponse format
+        filtered_response = {
+            "message": response.get("message", {}),
+            "context": response.get("context", {}),
+            "sources": response.get("sources", []),  # Include sources array
+            "session_state": response.get("session_state", request.session_id or "")
+        }
+        
+        return RAGResponse(**filtered_response)
+        
+    except Exception as e:
+        logger.error(f"RAG query failed: {e}")
+        raise HTTPException(status_code=500, detail=f"RAG query failed: {e}")
+
 # Protected RAG Retrieval Endpoints
 @app.post("/rag/query", response_model=RAGResponse)
 async def rag_query(
@@ -795,7 +831,8 @@ async def rag_query(
             max_tokens=request.max_tokens,
             custom_system_prompt=request.custom_system_prompt,
             include_search_details=request.include_search_details,
-            conversation_history=conversation_history
+            conversation_history=conversation_history,
+            session_id=request.session_id  # Pass session_id through
         )
         
         # Add user info to metadata
@@ -817,10 +854,10 @@ async def rag_query(
                 cosmo_db_manager.store_rag_interaction(
                     session_id=request.session_id,
                     query=request.query,
-                    response=response.get("response", ""),
+                    response=response.get("message", {}).get("content", ""),
                     user_info=user_info,
                     metadata=response.get("metadata", {}),
-                    sources=response.get("sources", [])
+                    sources=response.get("context", {}).get("data_points", [])
                 )
                 logger.info(f"Stored RAG interaction in CosmoDB for session {request.session_id}")
                 
@@ -828,7 +865,15 @@ async def rag_query(
                 logger.warning(f"Failed to store interaction in CosmoDB: {cosmo_error}")
                 # Don't fail the request if CosmoDB storage fails
         
-        return RAGResponse(**response)
+        # Extract only the fields needed for the new RAGResponse format
+        filtered_response = {
+            "message": response.get("message", {}),
+            "context": response.get("context", {}),
+            "sources": response.get("sources", []),  # Include sources array
+            "session_state": response.get("session_state", request.session_id or "")
+        }
+        
+        return RAGResponse(**filtered_response)
         
     except Exception as e:
         logger.error(f"RAG query error: {e}")
@@ -851,6 +896,16 @@ async def rag_stream(
         full_response = ""
         response_metadata = {}
         response_sources = []
+        
+        # Debug: collect all chunks for file output
+        all_chunks = []
+        debug_info = {
+            "timestamp": datetime.now().isoformat(),
+            "query": request.query,
+            "session_id": request.session_id,
+            "user_email": current_user.email,
+            "chunks": []
+        }
         
         # Get conversation history if session_id is provided
         conversation_history = []
@@ -882,20 +937,30 @@ async def rag_stream(
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
                 custom_system_prompt=request.custom_system_prompt,
-                conversation_history=conversation_history
+                conversation_history=conversation_history,
+                session_id=request.session_id  # Pass session_id through
             ):
                 # Add user info to metadata
                 if "rag_metadata" in chunk:
                     chunk["rag_metadata"]["user"] = current_user.email
                 
+                # Debug: collect chunk for file output
+                debug_info["chunks"].append(chunk)
+                all_chunks.append(chunk)
+                
                 # Collect data for CosmoDB storage
                 if chunk.get("type") == "chunk":
                     full_response += chunk.get("content", "")
-                elif chunk.get("type") == "sources":
+                elif chunk.get("type") == "context_ready":
+                    # Extract sources from context_ready chunk
                     response_sources = chunk.get("sources", [])
                 elif chunk.get("type") == "complete":
                     response_metadata = chunk.get("metadata", {})
                     full_response = chunk.get("full_response", full_response)
+                    # Also check for sources in rag_metadata
+                    rag_metadata = chunk.get("rag_metadata", {})
+                    if rag_metadata.get("sources") and not response_sources:
+                        response_sources = rag_metadata["sources"]
                 
                 # Format chunk as Server-Sent Events
                 chunk_data = json.dumps(chunk)
@@ -932,6 +997,48 @@ async def rag_stream(
                 except Exception as cosmo_error:
                     logger.warning(f"Failed to store streaming interaction in CosmoDB: {cosmo_error}")
                     # Don't fail the stream if CosmoDB storage fails
+            
+            # Transform sources to frontend format if needed
+            if response_sources:
+                formatted_sources = []
+                for source in response_sources:
+                    # Handle both raw source format and already formatted sources
+                    if "title" not in source:  # Raw format, need to transform
+                        formatted_source = {
+                            "title": Path(source.get("source_file", "Unknown")).stem,  # Document title without extension
+                            "content": source.get("content", ""),
+                            "source": Path(source.get("source_file", "Unknown")).name,  # Filename with extension for citations
+                            "chunk_id": source.get("document_id", ""),
+                            "score": round(source.get("score", 0), 3)
+                        }
+                        formatted_sources.append(formatted_source)
+                    else:  # Already formatted
+                        formatted_sources.append(source)
+                response_sources = formatted_sources
+            
+            # Debug: Write all collected chunks to file
+            debug_info["final_response"] = full_response
+            debug_info["response_metadata"] = response_metadata
+            debug_info["response_sources"] = response_sources
+            debug_info["total_chunks"] = len(all_chunks)
+            
+            try:
+                with open("answer_stream.txt", "w", encoding="utf-8") as f:
+                    f.write("=== STREAMING RAG DEBUG OUTPUT ===\n")
+                    f.write(f"Timestamp: {debug_info['timestamp']}\n")
+                    f.write(f"Query: {debug_info['query']}\n")
+                    f.write(f"Session ID: {debug_info['session_id']}\n")
+                    f.write(f"User: {debug_info['user_email']}\n")
+                    f.write(f"Total Chunks: {debug_info['total_chunks']}\n")
+                    f.write("\n=== FINAL ASSEMBLED RESPONSE ===\n")
+                    f.write(full_response)
+                    f.write("\n\n=== SOURCES ===\n")
+                    f.write(json.dumps(response_sources, indent=2, ensure_ascii=False))
+                    f.write("\n\n=== METADATA ===\n")
+                    f.write(json.dumps(response_metadata, indent=2, ensure_ascii=False))
+                logger.info(f"Debug info written to answer_stream.txt with {len(all_chunks)} chunks")
+            except Exception as debug_error:
+                logger.warning(f"Failed to write debug info to file: {debug_error}")
             
             # Send completion signal
             yield f"data: {json.dumps({'type': 'stream_complete'})}\n\n"
@@ -1390,6 +1497,107 @@ async def run_training_pipeline(request: TrainingRequest):
             "message": f"Training pipeline failed: {str(e)}",
             "end_time": datetime.now().isoformat()
         })
+
+# Citation endpoint for document access
+@app.get("/citation/{filename:path}")
+async def get_citation(filename: str):
+    """
+    Generate SAS URL for document citation and redirect to it.
+    
+    Args:
+        filename: The filename of the document to access
+        
+    Returns:
+        Redirect to the SAS URL for the document
+    """
+    try:
+        # Get Azure Storage configuration
+        connection_string = os.getenv('AZURE_STORAGE_CONNECTION_STRING')
+        container_name = os.getenv('AZURE_CONTAINER_NAME', 'security-documents')
+        
+        if not connection_string:
+            logger.error("AZURE_STORAGE_CONNECTION_STRING not configured")
+            raise HTTPException(status_code=500, detail="Storage configuration not available")
+        
+        # URL decode the filename in case it has special characters
+        filename = urllib.parse.unquote(filename)
+        
+        # Create blob service client
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        
+        # Construct blob name (assuming documents are in md_files folder)
+        blob_name = f"md_files/{filename}"
+        
+        # Get blob client for direct access
+        blob_client = blob_service_client.get_blob_client(
+            container=container_name,
+            blob=blob_name
+        )
+        
+        # Download blob content directly
+        blob_data = blob_client.download_blob()
+        content = blob_data.readall()
+        
+        logger.info(f"Successfully fetched blob content for {filename}, size: {len(content)} bytes")
+        
+        # Return the file content with proper headers
+        from fastapi.responses import Response
+        return Response(
+            content=content,
+            media_type='text/markdown',
+            headers={
+                'Access-Control-Allow-Origin': '*',
+                'Content-Disposition': f'inline; filename="{filename}"',
+                'Cache-Control': 'public, max-age=3600'  # Cache for 1 hour
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to generate SAS URL for {filename}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate citation URL: {str(e)}")
+
+# Add debug endpoint to save answer to file
+@app.get("/debug/save-answer")
+async def debug_save_answer():
+    """Debug endpoint to collect chunks and save final answer to answer.txt"""
+    if not rag_manager:
+        return {"error": "RAG Manager not initialized"}
+    
+    try:
+        # Generate RAG response
+        response = rag_manager.generate_rag_response(
+            query="Who is responsible for developing cybersecurity policies?",
+            top_k=1,
+            session_id="debug_session"
+        )
+        
+        # Extract the final answer components
+        final_answer = {
+            "message_content": response.get("message", {}).get("content", ""),
+            "sources": response.get("sources", []),
+            "context": response.get("context", {}),
+            "session_state": response.get("session_state", "")
+        }
+        
+        # Save to answer.txt
+        import json
+        with open("answer.txt", "w", encoding="utf-8") as f:
+            json.dump(final_answer, f, indent=2, ensure_ascii=False)
+        
+        return {
+            "success": True,
+            "message": "Answer saved to answer.txt",
+            "citation_in_content": "[" in final_answer["message_content"] and "]" in final_answer["message_content"],
+            "sources_count": len(final_answer["sources"]),
+            "preview": final_answer["message_content"][:200] + "..." if len(final_answer["message_content"]) > 200 else final_answer["message_content"]
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__
+        }
 
 if __name__ == "__main__":
     # Development server configuration

@@ -128,12 +128,15 @@ class RAGManager:
             print(f"🤖 Generating LLM response...")
             generation_start = time.time()
             
+            # Filter out session_id from kwargs as LLM manager doesn't accept it
+            llm_kwargs = {k: v for k, v in kwargs.items() if k != 'session_id'}
+            
             llm_result = self.llm_manager.generate_response(
                 query=query,
                 system_message=system_message,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                **kwargs
+                **llm_kwargs
             )
             
             generation_time = time.time() - generation_start
@@ -143,7 +146,17 @@ class RAGManager:
                 # LLM generation failed
                 return {
                     "success": False,
-                    "response": None,
+                    "message": {
+                        "content": "",
+                        "role": "assistant"
+                    },
+                    "context": {
+                        "data_points": [],
+                        "followup_questions": None,
+                        "thoughts": [{"title": "Error", "description": "LLM generation failed"}]
+                    },
+                    "sources": [],  # Empty sources array for error case
+                    "session_state": kwargs.get("session_id", ""),
                     "error": f"LLM generation failed: {llm_result.get('error', 'Unknown error')}",
                     "metadata": {
                         "query": query,
@@ -156,12 +169,54 @@ class RAGManager:
             
             print(f"   ✅ Generated response in {generation_time:.2f}s")
             
-            # Step 5: Prepare final response
+            # Step 5: Prepare final response in new format
+            response_content = llm_result["response"]
+            
+            # Prepare data_points from sources (content snippets)
+            data_points = []
+            for source in sources:
+                content_preview = source.get("content_preview", "")
+                if not content_preview and source.get("content"):
+                    # Fallback to truncated content if no preview
+                    content = source.get("content", "")
+                    content_preview = content[:300] + "..." if len(content) > 300 else content
+                
+                data_point = f"Document Title: {source.get('source_file', 'Unknown')} - {content_preview}"
+                data_points.append(data_point)
+            
+            # Prepare sources array in the format frontend expects
+            formatted_sources = []
+            for source in sources:
+                formatted_source = {
+                    "title": Path(source.get("source_file", "Unknown")).stem,  # Document title without extension
+                    "content": source.get("content", ""),
+                    "source": Path(source.get("source_file", "Unknown")).name,  # Filename with extension for citations
+                    "chunk_id": source.get("document_id", ""),
+                    "score": round(source.get("score", 0), 3)
+                }
+                formatted_sources.append(formatted_source)
+            
+            # Prepare thoughts section
+            thoughts = [
+                {
+                    "title": "Search Results",
+                    "description": f"Found {len(retrieved_docs)} relevant sources"
+                }
+            ]
+            
             rag_response = {
                 "success": True,
-                "response": llm_result["response"],
-                "sources": sources,
-                "query": query,
+                "message": {
+                    "content": response_content,
+                    "role": "assistant"
+                },
+                "context": {
+                    "data_points": data_points,
+                    "followup_questions": None,
+                    "thoughts": thoughts
+                },
+                "sources": formatted_sources,  # Add sources array for frontend
+                "session_state": kwargs.get("session_id", ""),
                 "metadata": {
                     "retrieval": {
                         "documents_found": len(retrieved_docs),
@@ -196,7 +251,17 @@ class RAGManager:
         except Exception as e:
             error_response = {
                 "success": False,
-                "response": None,
+                "message": {
+                    "content": "",
+                    "role": "assistant"
+                },
+                "context": {
+                    "data_points": [],
+                    "followup_questions": None,
+                    "thoughts": [{"title": "Error", "description": str(e)}]
+                },
+                "sources": [],  # Empty sources array for exception case
+                "session_state": kwargs.get("session_id", ""),
                 "error": str(e),
                 "error_type": type(e).__name__,
                 "metadata": {
@@ -272,12 +337,15 @@ class RAGManager:
                 )
                 
                 # Generate response with conversation history but without document context
+                # Filter out session_id from kwargs as LLM manager doesn't accept it
+                llm_kwargs = {k: v for k, v in kwargs.items() if k != 'session_id'}
+                
                 for chunk in self.llm_manager.generate_streaming_response(
                     query=query,
                     system_message=system_message,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    **kwargs
+                    **llm_kwargs
                 ):
                     # Add RAG metadata to chunks
                     chunk["rag_metadata"] = {
@@ -318,12 +386,15 @@ class RAGManager:
             
             generation_start = time.time()
             
+            # Filter out session_id from kwargs as LLM manager doesn't accept it
+            llm_kwargs = {k: v for k, v in kwargs.items() if k != 'session_id'}
+            
             for chunk in self.llm_manager.generate_streaming_response(
                 query=query,
                 system_message=system_message,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                **kwargs
+                **llm_kwargs
             ):
                 # Add RAG metadata to chunks
                 if chunk.get("type") == "complete":
@@ -417,6 +488,7 @@ class RAGManager:
                 "section": section,
                 "score": score,
                 "chunk_index": doc.get('chunk_index', 0),
+                "content": content,  # Add full content for data_points
                 "content_preview": content[:200] + "..." if len(content) > 200 else content
             })
             
@@ -479,8 +551,9 @@ Guidelines:
 - Base your response primarily on the provided context
 - Use conversation history to understand the flow of the discussion and provide contextually relevant answers
 - If the context doesn't contain enough information, acknowledge this limitation
-- Cite specific sources when making claims
-- Provide direct quotes when helpful
+- When referencing information from documents, cite sources using square brackets with the filename (e.g., [security_policy.pdf], [access_control.pdf])
+- Include the document filename in square brackets immediately after making a claim or statement based on that document
+- Provide direct quotes when helpful, followed by the source in square brackets
 - If asked about something not in the context, clearly state this
 - Be concise but thorough in your responses
 - Reference previous exchanges when relevant to provide continuity{history}
@@ -488,7 +561,7 @@ Guidelines:
 Relevant Context:
 {context}
 
-Please provide helpful, accurate responses based on this context and conversation history."""
+Please provide helpful, accurate responses based on this context and conversation history. Remember to cite sources in square brackets using the document filename."""
         
         return default_prompt.format(context=context, history=history_section)
     
@@ -514,20 +587,41 @@ Please provide helpful, accurate responses based on this context and conversatio
             conversation_history=conversation_history
         )
         
+        # Filter out session_id from kwargs as LLM manager doesn't accept it
+        llm_kwargs = {k: v for k, v in kwargs.items() if k != 'session_id'}
+        
         llm_result = self.llm_manager.generate_response(
             query=query,
             system_message=system_message,
             temperature=temperature,
             max_tokens=max_tokens,
-            **kwargs
+            **llm_kwargs
         )
         
         if llm_result.get("success"):
+            response_content = llm_result["response"]
+            
+            # Prepare thoughts for no context case
+            thoughts = [
+                {
+                    "title": "Search Results",
+                    "description": "No relevant documents found"
+                }
+            ]
+            
             return {
                 "success": True,
-                "response": llm_result["response"],
-                "sources": [],
-                "query": query,
+                "message": {
+                    "content": response_content,
+                    "role": "assistant"
+                },
+                "context": {
+                    "data_points": [],
+                    "followup_questions": None,
+                    "thoughts": thoughts
+                },
+                "sources": [],  # Empty sources array for no-context case
+                "session_state": kwargs.get("session_id", ""),
                 "metadata": {
                     "has_context": False,
                     "has_conversation_history": conversation_history is not None and len(conversation_history) > 0,
@@ -543,10 +637,18 @@ Please provide helpful, accurate responses based on this context and conversatio
         else:
             return {
                 "success": False,
-                "response": None,
                 "error": f"No context found and LLM generation failed: {llm_result.get('error')}",
-                "sources": [],
-                "query": query,
+                "message": {
+                    "content": "",
+                    "role": "assistant"
+                },
+                "context": {
+                    "data_points": [],
+                    "followup_questions": None,
+                    "thoughts": [{"title": "Error", "description": "No context found and LLM generation failed"}]
+                },
+                "sources": [],  # Empty sources array for error case
+                "session_state": kwargs.get("session_id", ""),
                 "metadata": {
                     "has_context": False,
                     "has_conversation_history": conversation_history is not None and len(conversation_history) > 0,
