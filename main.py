@@ -85,7 +85,8 @@ app.add_middleware(
         "http://localhost:3000",      # Add this for frontend dev
         "http://127.0.0.1:3000",
         "https://blue-dune-0ef76e10f.2.azurestaticapps.net",
-        "https://brave-mushroom-08bac950f.2.azurestaticapps.net"       # Add this for frontend dev
+        "https://brave-mushroom-08bac950f.2.azurestaticapps.net",
+        "https://kind-beach-02665c20f.1.azurestaticapps.net"       # Add this for frontend dev
     ],
     allow_credentials=True,
     allow_methods=["*"],
