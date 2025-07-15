@@ -532,8 +532,22 @@ class ContentManager:
             }
     
     def get_supported_file_types(self) -> List[str]:
-        """Get list of supported file types for content extraction."""
-        return ['.pdf', '.docx', '.doc', '.txt', '.md', '.html', '.rtf']
+        return [
+            '.cpp', '.cxx', '.cc', '.h', '.hpp',      # C++
+            '.cs',                                    # C#
+            '.java', '.kt', '.kts',                   # Java/Kotlin
+            '.py',                                    # Python
+            '.js', '.ts',                             # JavaScript/TypeScript
+            '.go', '.rs', '.swift', '.m', '.mm',      # Go, Rust, Swift, Objective-C
+            '.php', '.rb', '.pl', '.pm', '.scala',    # PHP, Ruby, Perl, Scala
+            '.sh', '.bash', '.zsh',                   # Shell
+            '.r', '.R', '.Rmd',                       # R
+            '.md', '.html', '.htm', '.css',           # Docs/UI
+            '.json', '.yaml', '.yml', '.xml', '.toml', # Config
+            'Makefile', '.mk', 'Dockerfile',          # Build
+            '.ps1', '.psm1', '.bat', '.cmd',          # Scripts
+            '.txt'                                    # Plain text
+        ]
     
     def get_image_extraction_support(self) -> List[str]:
         """Get list of file types that support image extraction."""
@@ -585,3 +599,4 @@ class ContentManager:
                 return f"[Fallback extraction not supported for {file_ext} files]"
         except Exception as e:
             return f"[Error reading file: {str(e)}]"
+ 
