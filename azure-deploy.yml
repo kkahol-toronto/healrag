@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  AZURE_WEBAPP_NAME: healrag-webapp    # Set this to your app name
+  AZURE_WEBAPP_NAME: NTTCodeGenerator    # Set this to your app name
   AZURE_WEBAPP_PACKAGE_PATH: '.'       # Set this to the path to your web app project, defaults to the repository root
 
 jobs:
@@ -31,7 +31,7 @@ jobs:
       with:
         context: .
         push: true
-        tags: ${{ secrets.REGISTRY_LOGIN_SERVER }}/healrag:${{ github.sha }}
+        tags: ${{ secrets.REGISTRY_LOGIN_SERVER }}/nttcodeimage:${{ github.sha }}
         file: ./Dockerfile
 
   deploy:
@@ -48,4 +48,4 @@ jobs:
       with:
         app-name: ${{ env.AZURE_WEBAPP_NAME }}
         publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
-        images: ${{ secrets.REGISTRY_LOGIN_SERVER }}/healrag:${{ github.sha }} 
+        images: ${{ secrets.REGISTRY_LOGIN_SERVER }}/nttcodeimage:${{ github.sha }} 

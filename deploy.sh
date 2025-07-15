@@ -11,9 +11,9 @@ if [ -f .env ]; then
 fi
 
 # Configuration
-IMAGE_NAME="healrag"
+IMAGE_NAME="nttcodeimage"
 TAG="latest"
-CONTAINER_NAME="healrag-container"
+CONTAINER_NAME="nttcodeimage-container"
 HOST_PORT="8000"
 CONTAINER_PORT="8000"
 
@@ -182,10 +182,10 @@ validate_azure_cli() {
 
 # Function to create or update Azure App Service
 deploy_webapp() {
-    local webapp_name="${1:-healrag-security}"
-    local resource_group="${2:-medical}"
+    local webapp_name="${1:-NTTCodeGenerator}"
+    local resource_group="${2:-coding}"
     local location="${3:-eastus}"
-    local plan_name="${4:-healrag-plan}"
+    local plan_name="${4:-nttcodegenerator-plan}"
     local sku="${5:-P3v3}"
     
     echo "🚀 Deploying to Azure App Service..."
@@ -316,6 +316,20 @@ configure_webapp_env() {
                 AZURE_SEARCH_SKILLSET_NAME="$AZURE_SEARCH_SKILLSET_NAME" \
                 INDEXER_SCHEDULE_MINUTES="$INDEXER_SCHEDULE_MINUTES" \
                 VECTOR_PROFILE_SEARCH="$VECTOR_PROFILE_SEARCH"
+    fi
+    
+    # Azure AD settings
+    if [ ! -z "$AZURE_AD_TENANT_ID" ] && [ ! -z "$AZURE_AD_CLIENT_ID" ]; then
+        # Update redirect URI to match the new web app name
+        local redirect_uri="https://$webapp_name.azurewebsites.net/auth/callback"
+        az webapp config appsettings set \
+            --name $webapp_name \
+            --resource-group $resource_group \
+            --settings \
+                AZURE_AD_TENANT_ID="$AZURE_AD_TENANT_ID" \
+                AZURE_AD_CLIENT_ID="$AZURE_AD_CLIENT_ID" \
+                AZURE_AD_CLIENT_SECRET="$AZURE_AD_CLIENT_SECRET" \
+                AZURE_AD_REDIRECT_URI="$redirect_uri"
     fi
     
     echo "✅ Environment variables configured!"
@@ -460,7 +474,7 @@ case "$1" in
         echo "  azure-webapp      - Full deployment (ACR + Web App + Continuous Deployment)"
         echo "  azure-webapp-only - Deploy/update existing webapp only"
         echo "                     Usage: $0 azure-webapp-only [webapp-name] [resource-group] [location] [plan-name] [sku]"
-        echo "                     Example: $0 azure-webapp-only healrag-security medical eastus healrag-plan P3v3"
+        echo "                     Example: $0 azure-webapp-only NTTCodeGenerator coding eastus nttcodegenerator-plan P3v3"
         echo ""
         echo "Required Azure environment variables in .env:"
         echo "  AZURE_CONTAINER_REGISTRY"
