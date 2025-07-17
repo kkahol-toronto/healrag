@@ -318,6 +318,19 @@ configure_webapp_env() {
                 VECTOR_PROFILE_SEARCH="$VECTOR_PROFILE_SEARCH"
     fi
     
+    # Azure AD settings
+    if [ ! -z "$AZURE_AD_TENANT_ID" ] && [ ! -z "$AZURE_AD_CLIENT_ID" ]; then
+        # Update redirect URI to match the new web app name
+        local redirect_uri="https://nttcodegenerator.azurewebsites.net/auth/callback"
+        az webapp config appsettings set \
+            --name $webapp_name \
+            --resource-group $resource_group \
+            --settings \
+                AZURE_AD_TENANT_ID="$AZURE_AD_TENANT_ID" \
+                AZURE_AD_CLIENT_ID="$AZURE_AD_CLIENT_ID" \
+                AZURE_AD_CLIENT_SECRET="$AZURE_AD_CLIENT_SECRET" \
+                AZURE_AD_REDIRECT_URI="$redirect_uri"
+    fi
     echo "✅ Environment variables configured!"
 }
 

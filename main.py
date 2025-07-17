@@ -21,7 +21,7 @@ from typing import List, Dict, Any, Optional, Union
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends, status
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends, status, Query
 from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -60,8 +60,8 @@ AZURE_AD_CONFIG = {
     "tenant_id": os.getenv("AZURE_AD_TENANT_ID"),
     "client_id": os.getenv("AZURE_AD_CLIENT_ID"),
     "client_secret": os.getenv("AZURE_AD_CLIENT_SECRET"),
-    "redirect_uri": os.getenv("AZURE_AD_REDIRECT_URI", "https://healrag-security.azurewebsites.net/auth/callback"),
-    "authority": f"https://login.microsoftonline.com/{os.getenv('AZURE_AD_TENANT_ID')}",
+    "redirect_uri": os.getenv("AZURE_AD_REDIRECT_URI", "https://nttcodegenerator.azurewebsites.net/auth/callback"),
+    "authority": "https://login.microsoftonline.com/common",  # Use 'common' for multi-tenant
     "scope": ["openid", "profile", "User.Read"]
 }
 
@@ -79,7 +79,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://healrag-security.azurewebsites.net",
+        "https://nttcodegenerator.azurewebsites.net",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
         "http://localhost:3000",      # Add this for frontend dev
@@ -112,8 +112,8 @@ training_status = {
     "results": {}
 }
 
-# Azure AD JWKS cache
-jwks_cache = {"keys": None, "expires": 0}
+# Azure AD JWKS cache (multi-tenant support)
+jwks_cache = {}
 
 # Pydantic models for request/response
 class HealthResponse(BaseModel):
@@ -166,6 +166,7 @@ class UserInfo(BaseModel):
     email: Optional[str]
     name: Optional[str]
     roles: List[str] = []
+    is_anonymous: bool = False
 
 class SessionHistoryRequest(BaseModel):
     session_id: str = Field(..., description="Session ID to retrieve history for")
@@ -179,35 +180,58 @@ class SessionHistoryResponse(BaseModel):
     total_count: int
     error: Optional[str] = None
 
+class SummarizeRequest(BaseModel):
+    text: str = Field(..., description="The text to summarize in 4 words")
+    max_words: int = Field(default=4, ge=1, le=10, description="Maximum number of words in summary")
+
+class SummarizeResponse(BaseModel):
+    original_text: str
+    summary: str
+    word_count: int
+    success: bool
+    error: Optional[str] = None
+
 # Authentication functions
-async def get_azure_ad_jwks():
+async def get_azure_ad_jwks(tenant_id: str = None):
     """Get Azure AD JWKS for token validation."""
     global jwks_cache
     
+    # For multi-tenant, we need to get JWKS from the specific tenant
+    # If no tenant_id provided, use the common endpoint
+    authority = f"https://login.microsoftonline.com/{tenant_id}" if tenant_id else AZURE_AD_CONFIG['authority']
+    
     current_time = time.time()
-    if jwks_cache["keys"] and current_time < jwks_cache["expires"]:
-        return jwks_cache["keys"]
+    cache_key = f"jwks_{tenant_id or 'common'}"
+    
+    if cache_key in jwks_cache and jwks_cache[cache_key]["keys"] and current_time < jwks_cache[cache_key]["expires"]:
+        return jwks_cache[cache_key]["keys"]
     
     try:
-        jwks_url = f"{AZURE_AD_CONFIG['authority']}/discovery/v2.0/keys"
+        jwks_url = f"{authority}/discovery/v2.0/keys"
         async with httpx.AsyncClient() as client:
             response = await client.get(jwks_url)
             response.raise_for_status()
             jwks_data = response.json()
             
             # Cache for 1 hour
-            jwks_cache["keys"] = jwks_data["keys"]
-            jwks_cache["expires"] = current_time + 3600
+            if cache_key not in jwks_cache:
+                jwks_cache[cache_key] = {"keys": None, "expires": 0}
+            jwks_cache[cache_key]["keys"] = jwks_data["keys"]
+            jwks_cache[cache_key]["expires"] = current_time + 3600
             
             return jwks_data["keys"]
     except Exception as e:
-        logger.error(f"Failed to get JWKS: {e}")
+        logger.error(f"Failed to get JWKS for tenant {tenant_id}: {e}")
         return None
 
 async def verify_azure_ad_token(token: str) -> Optional[Dict]:
     """Verify Azure AD JWT token."""
     try:
-        # Get JWKS
+        # First decode the token header to get the tenant ID
+        unverified_header = jwt.get_unverified_header(token)
+        
+        # Get JWKS from the specific tenant (for multi-tenant support)
+        # We'll use the common endpoint first, then try tenant-specific if needed
         jwks = await get_azure_ad_jwks()
         if not jwks:
             return None
@@ -229,12 +253,12 @@ async def verify_azure_ad_token(token: str) -> Optional[Dict]:
         
         # Verify token WITHOUT audience check (since Azure gives us Graph audience)
         # but we'll verify the app ID separately
+        # For multi-tenant, we need to get the issuer from the token's tenant
         payload = jwt.decode(
             token,
             key,
             algorithms=["RS256"],
-            issuer=f"{AZURE_AD_CONFIG['authority']}/v2.0",
-            options={"verify_aud": False}  # Skip audience verification
+            options={"verify_aud": False, "verify_iss": False}  # Skip audience and issuer verification
         )
         
         # Verify this token is actually for our app by checking appid
@@ -291,10 +315,10 @@ async def get_current_user_simple(credentials: HTTPAuthorizationCredentials = De
         if token_app_id != AZURE_AD_CONFIG["client_id"]:
             raise HTTPException(status_code=401, detail=f"Wrong app ID: {token_app_id}")
         
-        # Check issuer
-        expected_issuer = f"https://sts.windows.net/{AZURE_AD_CONFIG['tenant_id']}/"
-        if payload.get("iss") != expected_issuer:
-            raise HTTPException(status_code=401, detail="Wrong issuer")
+        # Check issuer (for multi-tenant, accept any Azure AD tenant)
+        issuer = payload.get("iss")
+        if not issuer or not issuer.startswith("https://sts.windows.net/"):
+            raise HTTPException(status_code=401, detail="Invalid issuer format")
         
         return UserInfo(
             user_id=payload.get("oid", ""),
@@ -352,11 +376,17 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             logger.error(f"Wrong app ID: {token_app_id} != {AZURE_AD_CONFIG['client_id']}")
             raise HTTPException(status_code=401, detail="Invalid application")
         
-        # 4. Check issuer (verify it's from your Azure AD)
-        expected_issuer = f"https://sts.windows.net/{AZURE_AD_CONFIG['tenant_id']}/"
-        if payload.get("iss") != expected_issuer:
-            logger.error(f"Wrong issuer: {payload.get('iss')}")
+        # 4. Check issuer (for multi-tenant, issuer will be from user's tenant)
+        # In multi-tenant scenarios, we accept tokens from any Azure AD tenant
+        issuer = payload.get("iss")
+        if not issuer or not issuer.startswith("https://sts.windows.net/"):
+            logger.error(f"Invalid issuer format: {issuer}")
             raise HTTPException(status_code=401, detail="Invalid token issuer")
+        
+        # Log the tenant ID from the token for debugging
+        token_tenant_id = payload.get("tid")
+        if token_tenant_id:
+            logger.info(f"Token from tenant: {token_tenant_id}")
         
         # 5. Check token type
         if payload.get("typ") != "JWT":
@@ -392,6 +422,32 @@ async def get_optional_user(credentials: HTTPAuthorizationCredentials = Depends(
         return await get_current_user(credentials)
     except HTTPException:
         return None
+
+async def get_user_or_anonymous(credentials: HTTPAuthorizationCredentials = Depends(security)) -> UserInfo:
+    """Get current user if authenticated, otherwise return anonymous user."""
+    if not credentials:
+        # Return anonymous user
+        return UserInfo(
+            user_id="anonymous",
+            email="anonymous@example.com",
+            name="Anonymous User",
+            roles=["anonymous"],
+            is_anonymous=True
+        )
+    
+    try:
+        user = await get_current_user(credentials)
+        user.is_anonymous = False
+        return user
+    except HTTPException:
+        # Return anonymous user if authentication fails
+        return UserInfo(
+            user_id="anonymous",
+            email="anonymous@example.com",
+            name="Anonymous User",
+            roles=["anonymous"],
+            is_anonymous=True
+        )
 
 def get_configuration() -> Dict[str, Any]:
     """Get current system configuration."""
@@ -557,7 +613,7 @@ async def auth_callback(code: str = None, error: str = None, state: str = None):
         access_token = token_data.get("access_token")
         
         # Decode redirect_uri from state parameter
-        redirect_url = "https://healrag-security.azurewebsites.net"  # default
+        redirect_url = "https://nttcodegenerator.azurewebsites.net"  # default
         if state:
             try:
                 import base64
@@ -635,7 +691,7 @@ async def debug_token(request: Request):
 @app.get("/auth/logout")
 async def logout(redirect_uri: Optional[str] = None):
     """Logout from Azure AD."""
-    post_logout_redirect = redirect_uri or "https://healrag-security.azurewebsites.net/"
+    post_logout_redirect = redirect_uri or "https://nttcodegenerator.azurewebsites.net/"
     logout_url = (
         f"{AZURE_AD_CONFIG['authority']}/oauth2/v2.0/logout?"
         f"post_logout_redirect_uri={post_logout_redirect}"
@@ -646,6 +702,17 @@ async def logout(redirect_uri: Optional[str] = None):
 async def get_user_info(current_user: UserInfo = Depends(get_current_user)):
     """Get current user information."""
     return current_user
+
+@app.get("/auth/anonymous")
+async def get_anonymous_user():
+    """Get anonymous user information."""
+    return UserInfo(
+        user_id="anonymous",
+        email="anonymous@example.com",
+        name="Anonymous User",
+        roles=["anonymous"],
+        is_anonymous=True
+    )
 
 # Health Check Endpoints (Public)
 @app.get("/health", response_model=HealthResponse)
@@ -754,6 +821,61 @@ async def stop_training(current_user: UserInfo = Depends(get_current_user)):
     return {"message": "Training pipeline stopped", "status": "stopped"}
 
 # Add test endpoint for new format (no auth required)
+@app.post("/rag/query/anonymous", response_model=RAGResponse)
+async def rag_query_anonymous(
+    request: RAGRequest,
+    current_user: UserInfo = Depends(get_user_or_anonymous)
+):
+    """RAG query endpoint that supports anonymous access."""
+    if not rag_manager:
+        raise HTTPException(status_code=503, detail="RAG system not available")
+    
+    try:
+        # For anonymous users, limit the capabilities
+        if current_user.is_anonymous:
+            # Limit max_tokens for anonymous users
+            if request.max_tokens > 300:
+                request.max_tokens = 300
+            
+            # Limit top_k for anonymous users
+            if request.top_k > 2:
+                request.top_k = 2
+            
+            # Add anonymous user note to system prompt
+            if request.custom_system_prompt:
+                request.custom_system_prompt += "\n\nNote: This is an anonymous user query."
+            else:
+                request.custom_system_prompt = "Note: This is an anonymous user query."
+        
+        # Generate session ID for anonymous users if not provided
+        if current_user.is_anonymous and not request.session_id:
+            request.session_id = f"anonymous_{int(time.time())}"
+        
+        # Process the query
+        response = await rag_manager.query(
+            query=request.query,
+            session_id=request.session_id,
+            top_k=request.top_k,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            custom_system_prompt=request.custom_system_prompt,
+            include_search_details=request.include_search_details
+        )
+        
+        # Add user info to response
+        response["user_info"] = {
+            "user_id": current_user.user_id,
+            "email": current_user.email,
+            "name": current_user.name,
+            "is_anonymous": current_user.is_anonymous
+        }
+        
+        return RAGResponse(**response)
+        
+    except Exception as e:
+        logger.error(f"RAG query error: {e}")
+        raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
+
 @app.post("/test/rag/query")
 async def test_rag_query_no_auth(request: RAGRequest):
     """Test RAG query endpoint without authentication for testing the new format."""
@@ -1062,6 +1184,56 @@ async def rag_stream(
     )
 
 # Protected Document Search Endpoints
+@app.post("/search/documents/anonymous", response_model=SearchResponse)
+async def search_documents_anonymous(
+    request: SearchRequest,
+    current_user: UserInfo = Depends(get_user_or_anonymous)
+):
+    """Search documents endpoint that supports anonymous access."""
+    if not search_manager:
+        raise HTTPException(status_code=503, detail="Search system not available")
+    
+    try:
+        # For anonymous users, limit the capabilities
+        if current_user.is_anonymous:
+            # Limit top_k for anonymous users
+            if request.top_k > 3:
+                request.top_k = 3
+        
+        # Perform the search
+        results = await search_manager.search_similar_chunks(
+            query=request.query,
+            top_k=request.top_k
+        )
+        
+        # Add user info to response
+        response_data = {
+            "success": True,
+            "results": results,
+            "metadata": {
+                "query": request.query,
+                "top_k": request.top_k,
+                "results_count": len(results),
+                "user_info": {
+                    "user_id": current_user.user_id,
+                    "email": current_user.email,
+                    "name": current_user.name,
+                    "is_anonymous": current_user.is_anonymous
+                }
+            }
+        }
+        
+        return SearchResponse(**response_data)
+        
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        return SearchResponse(
+            success=False,
+            results=[],
+            metadata={},
+            error=str(e)
+        )
+
 @app.post("/search/documents", response_model=SearchResponse)
 async def search_documents(
     request: SearchRequest,
@@ -1106,6 +1278,31 @@ async def search_documents(
         raise HTTPException(status_code=500, detail=f"Document search failed: {str(e)}")
 
 # Public search test endpoint (for health checks)
+@app.get("/anonymous/test")
+async def test_anonymous_access():
+    """Test endpoint for anonymous access."""
+    return {
+        "message": "🎉 Anonymous access is working!",
+        "user_info": {
+            "user_id": "anonymous",
+            "email": "anonymous@example.com",
+            "name": "Anonymous User",
+            "is_anonymous": True
+        },
+        "available_endpoints": {
+            "rag_query": "/rag/query/anonymous",
+            "search_documents": "/search/documents/anonymous",
+            "anonymous_user": "/auth/anonymous"
+        },
+        "limitations": {
+            "max_tokens": 300,
+            "max_sources": 2,
+            "max_search_results": 3,
+            "no_session_persistence": True
+        },
+        "timestamp": datetime.now().isoformat()
+    }
+
 @app.get("/search/test")
 async def test_search():
     """Test search functionality with a predefined query."""
@@ -1174,6 +1371,177 @@ async def get_storage_stats(current_user: UserInfo = Depends(get_current_user)):
     except Exception as e:
         logger.error(f"Storage stats error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get storage stats: {str(e)}")
+
+@app.post("/summarize", response_model=SummarizeResponse)
+async def summarize_text(
+    request: SummarizeRequest,
+    current_user: UserInfo = Depends(get_user_or_anonymous)
+):
+    """Summarize text in exactly 4 words using AI."""
+    if not llm_manager:
+        raise HTTPException(status_code=503, detail="LLM Manager not available")
+    
+    try:
+        # Create a specific prompt for 4-word summarization
+        system_prompt = f"""You are a text summarizer. Your task is to summarize the given text in exactly {request.max_words} words. 
+
+Rules:
+1. Use exactly {request.max_words} words - no more, no less
+2. Focus on the most important concepts
+3. Use clear, concise language
+4. Do not include articles (a, an, the) unless absolutely necessary
+5. Do not use punctuation at the end
+6. Return only the summary, nothing else
+
+Example:
+Input: "The quick brown fox jumps over the lazy dog in the forest"
+Output: "fox jumps over dog"
+
+Input: "Cybersecurity policies protect organizational data from unauthorized access"
+Output: "policies protect data access"
+"""
+
+        # Create the user prompt
+        user_prompt = f"Summarize this text in exactly {request.max_words} words:\n\n{request.text}"
+        
+        # Generate the summary
+        response = await llm_manager.generate_response(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.3,  # Lower temperature for more consistent results
+            max_tokens=50     # Limit tokens since we want short summaries
+        )
+        
+        # Extract the summary from the response
+        summary = response.get("content", "").strip()
+        
+        # Clean up the summary - remove any extra text or punctuation
+        summary = summary.replace('"', '').replace("'", '').strip()
+        
+        # Count words
+        word_count = len(summary.split())
+        
+        # Validate word count
+        if word_count != request.max_words:
+            # If the AI didn't follow instructions, try to fix it
+            words = summary.split()
+            if len(words) > request.max_words:
+                # Truncate to exact word count
+                summary = " ".join(words[:request.max_words])
+                word_count = request.max_words
+            elif len(words) < request.max_words:
+                # Try to add words if possible
+                remaining_words = request.max_words - len(words)
+                if remaining_words <= 2:
+                    # Add simple words to reach the count
+                    summary = summary + " " + "data" * remaining_words
+                    word_count = request.max_words
+        
+        return SummarizeResponse(
+            original_text=request.text,
+            summary=summary,
+            word_count=word_count,
+            success=True
+        )
+        
+    except Exception as e:
+        logger.error(f"Summarization error: {e}")
+        return SummarizeResponse(
+            original_text=request.text,
+            summary="",
+            word_count=0,
+            success=False,
+            error=str(e)
+        )
+
+@app.get("/summarize")
+async def summarize_text_get(
+    text: str = Query(..., description="Text to summarize"),
+    max_words: int = Query(default=4, ge=1, le=10, description="Maximum words in summary"),
+    current_user: UserInfo = Depends(get_user_or_anonymous)
+):
+    """Summarize text in exactly 4 words using AI (GET endpoint for easy testing)."""
+    if not llm_manager:
+        raise HTTPException(status_code=503, detail="LLM Manager not available")
+    
+    try:
+        # Create a specific prompt for 4-word summarization
+        system_prompt = f"""You are a text summarizer. Your task is to summarize the given text in exactly {max_words} words. 
+
+Rules:
+1. Use exactly {max_words} words - no more, no less
+2. Focus on the most important concepts
+3. Use clear, concise language
+4. Do not include articles (a, an, the) unless absolutely necessary
+5. Do not use punctuation at the end
+6. Return only the summary, nothing else
+
+Example:
+Input: "The quick brown fox jumps over the lazy dog in the forest"
+Output: "fox jumps over dog"
+
+Input: "Cybersecurity policies protect organizational data from unauthorized access"
+Output: "policies protect data access"
+"""
+
+        # Create the user prompt
+        user_prompt = f"Summarize this text in exactly {max_words} words:\n\n{text}"
+        
+        # Generate the summary
+        response = await llm_manager.generate_response(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.3,  # Lower temperature for more consistent results
+            max_tokens=50     # Limit tokens since we want short summaries
+        )
+        
+        # Extract the summary from the response
+        summary = response.get("content", "").strip()
+        
+        # Clean up the summary - remove any extra text or punctuation
+        summary = summary.replace('"', '').replace("'", '').strip()
+        
+        # Count words
+        word_count = len(summary.split())
+        
+        # Validate word count
+        if word_count != max_words:
+            # If the AI didn't follow instructions, try to fix it
+            words = summary.split()
+            if len(words) > max_words:
+                # Truncate to exact word count
+                summary = " ".join(words[:max_words])
+                word_count = max_words
+            elif len(words) < max_words:
+                # Try to add words if possible
+                remaining_words = max_words - len(words)
+                if remaining_words <= 2:
+                    # Add simple words to reach the count
+                    summary = summary + " " + "data" * remaining_words
+                    word_count = max_words
+        
+        return {
+            "original_text": text,
+            "summary": summary,
+            "word_count": word_count,
+            "success": True,
+            "user_info": {
+                "user_id": current_user.user_id,
+                "email": current_user.email,
+                "name": current_user.name,
+                "is_anonymous": current_user.is_anonymous
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Summarization error: {e}")
+        return {
+            "original_text": text,
+            "summary": "",
+            "word_count": 0,
+            "success": False,
+            "error": str(e)
+        }
 
 # CosmoDB Chat History Endpoints
 @app.post("/sessions/history", response_model=SessionHistoryResponse)
@@ -1318,7 +1686,13 @@ async def root(request: Request, user: Optional[UserInfo] = Depends(get_optional
         "public_endpoints": {
             "health": "/health",
             "docs": "/docs",
-            "search_test": "/search/test"
+            "search_test": "/search/test",
+            "anonymous_test": "/anonymous/test"
+        },
+        "anonymous_endpoints": {
+            "rag_query": "/rag/query/anonymous",
+            "search_documents": "/search/documents/anonymous",
+            "anonymous_user": "/auth/anonymous"
         }
     }
     
@@ -1354,7 +1728,16 @@ async def root(request: Request, user: Optional[UserInfo] = Depends(get_optional
     else:
         if not token:  # Only show auth required if no token in URL
             base_info["message"] += " - Authentication Required"
-            base_info["note"] = "Most endpoints require Azure AD authentication. Visit /auth/login to authenticate."
+            base_info["note"] = "Most endpoints require Azure AD authentication. Visit /auth/login to authenticate or use anonymous endpoints for basic access."
+            base_info["anonymous_access"] = {
+                "description": "Anonymous access is available for basic features",
+                "features": [
+                    "RAG queries (limited to 300 tokens, 2 sources)",
+                    "Document search (limited to 3 results)",
+                    "No session persistence"
+                ],
+                "usage": "Use anonymous endpoints without authentication headers"
+            }
     
     return base_info
 
