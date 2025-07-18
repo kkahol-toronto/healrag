@@ -36,12 +36,12 @@ import urllib.parse
 # Load environment variables
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(override=True)
 except ImportError:
     pass
 
 # Import HEALRAG components
-from healraglib import StorageManager, RAGManager, LLMManager, SearchIndexManager, CosmoDBManager
+from healraglib import StorageManager, RAGManager, LLMManager, SearchIndexManager, CosmoDBManager, FileGraphManager, GraphVisualizer
 from healraglib.content_manager import ContentManager
 
 # Configure logging
@@ -102,6 +102,8 @@ search_manager: Optional[SearchIndexManager] = None
 llm_manager: Optional[LLMManager] = None
 rag_manager: Optional[RAGManager] = None
 cosmo_db_manager: Optional[CosmoDBManager] = None
+file_graph_manager: Optional[FileGraphManager] = None
+graph_visualizer: Optional[GraphVisualizer] = None
 
 # Training pipeline status tracking
 training_status = {
@@ -154,7 +156,7 @@ class RAGResponse(BaseModel):
     message: Dict[str, str]  # {"content": "response text", "role": "assistant"}
     context: Dict[str, Any]  # {"data_points": [...], "followup_questions": None, "thoughts": [...]}
     sources: List[Dict[str, Any]]  # [{"title": "...", "content": "...", "source": "...", "chunk_id": "...", "score": ...}]
-    session_state: str  # session_id
+    session_state: Optional[str] = ""  # session_id (optional)
 
 class SearchResponse(BaseModel):
     success: bool
@@ -178,6 +180,29 @@ class SessionHistoryResponse(BaseModel):
     session_id: str
     interactions: List[Dict[str, Any]]
     total_count: int
+    error: Optional[str] = None
+
+class GraphRequest(BaseModel):
+    include_similarities: bool = Field(default=True, description="Include similarity relationships")
+    include_dependencies: bool = Field(default=True, description="Include dependency relationships")
+    similarity_threshold: float = Field(default=0.7, ge=0.0, le=1.0, description="Minimum similarity threshold")
+    layout: str = Field(default="force", description="Graph layout algorithm")
+    node_size_factor: float = Field(default=1.0, ge=0.1, le=3.0, description="Node size scaling factor")
+    edge_threshold: float = Field(default=0.5, ge=0.0, le=1.0, description="Minimum edge weight threshold")
+
+class FileRelationshipsRequest(BaseModel):
+    filename: str = Field(..., description="Name of the file to analyze")
+    max_relationships: int = Field(default=10, ge=1, le=50, description="Maximum number of relationships to return")
+
+class TitleSummarizerRequest(BaseModel):
+    text: str = Field(..., description="Text to summarize")
+    max_words: Optional[int] = Field(default=None, ge=1, le=20, description="Maximum number of words for summary")
+
+class TitleSummarizerResponse(BaseModel):
+    success: bool
+    summary: str
+    word_count: int
+    original_text: str
     error: Optional[str] = None
 
 # Authentication functions
@@ -409,7 +434,7 @@ def get_configuration() -> Dict[str, Any]:
 
 async def initialize_components():
     """Initialize all HEALRAG components."""
-    global storage_manager, content_manager, search_manager, llm_manager, rag_manager, cosmo_db_manager
+    global storage_manager, content_manager, search_manager, llm_manager, rag_manager, cosmo_db_manager, file_graph_manager, graph_visualizer
     
     try:
         config = get_configuration()
@@ -450,25 +475,43 @@ async def initialize_components():
         
         # Initialize LLM Manager
         if all([config["azure_openai_endpoint"], os.getenv("AZURE_OPENAI_KEY")]):
+            # Get LLM configuration from environment variables
+            llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
+            llm_max_tokens = int(os.getenv("LLM_MAX_TOKENS", "2000"))
+            
             llm_manager = LLMManager(
                 azure_openai_endpoint=config["azure_openai_endpoint"],
                 azure_openai_key=os.getenv("AZURE_OPENAI_KEY"),
                 azure_openai_deployment=config["azure_openai_chat_deployment"],
-                default_temperature=0.7,
-                default_max_tokens=500
+                default_temperature=llm_temperature,
+                default_max_tokens=llm_max_tokens
             )
-            logger.info("LLM Manager initialized")
+            logger.info(f"LLM Manager initialized - Temperature: {llm_temperature}, Max Tokens: {llm_max_tokens}")
         
         # Initialize RAG Manager
         if search_manager and llm_manager:
+            # Get RAG configuration from environment variables
+            rag_top_k = int(os.getenv("RAG_TOP_K", "3"))
+            rag_max_context_tokens = int(os.getenv("RAG_MAX_CONTEXT_TOKENS", "6000"))
+            rag_relevance_threshold = float(os.getenv("RAG_RELEVANCE_THRESHOLD", "0.005"))
+            rag_system_prompt = os.getenv("RAG_SYSTEM_PROMPT", None)
+            
             rag_manager = RAGManager(
                 search_index_manager=search_manager,
                 llm_manager=llm_manager,
-                default_top_k=3,
-                max_context_tokens=6000,
-                relevance_threshold=0.02
+                default_top_k=rag_top_k,
+                max_context_tokens=rag_max_context_tokens,
+                relevance_threshold=rag_relevance_threshold
             )
-            logger.info("RAG Manager initialized")
+            
+            # Store custom system prompt if provided
+            if rag_system_prompt:
+                rag_manager.default_system_prompt = rag_system_prompt
+                logger.info(f"RAG Manager initialized with custom system prompt")
+            else:
+                logger.info("RAG Manager initialized with default system prompt")
+            
+            logger.info(f"RAG Manager initialized - Top K: {rag_top_k}, Max Tokens: {rag_max_context_tokens}, Threshold: {rag_relevance_threshold}")
         
         # Initialize CosmoDB Manager (optional)
         cosmo_connection_string = os.getenv("AZURE_COSMO_CONNECTION_STRING")
@@ -489,6 +532,26 @@ async def initialize_components():
                 cosmo_db_manager = None
         else:
             logger.info("CosmoDB Manager not configured (optional)")
+        
+        # Initialize File Graph Manager
+        if storage_manager and search_manager:
+            file_graph_manager = FileGraphManager(
+                storage_manager=storage_manager,
+                search_manager=search_manager,
+                azure_openai_endpoint=config["azure_openai_endpoint"],
+                azure_openai_key=os.getenv("AZURE_OPENAI_KEY"),
+                azure_openai_deployment=config["azure_openai_embedding_deployment"],
+                azure_search_endpoint=config["azure_search_endpoint"],
+                azure_search_key=os.getenv("AZURE_SEARCH_KEY"),
+                azure_search_index_name=config["azure_search_index_name"]
+            )
+            logger.info("File Graph Manager initialized")
+            
+            # Initialize Graph Visualizer
+            graph_visualizer = GraphVisualizer(file_graph_manager)
+            logger.info("Graph Visualizer initialized")
+        else:
+            logger.info("File Graph Manager not configured (requires storage and search managers)")
         
         logger.info("All components initialized successfully")
         
@@ -764,6 +827,11 @@ async def test_rag_query_no_auth(request: RAGRequest):
     logger.info(f"Test RAG query: {request.query[:100]}...")
     
     try:
+        # Prepare kwargs for session_id
+        test_kwargs = {}
+        if request.session_id:
+            test_kwargs["session_id"] = request.session_id
+        
         response = rag_manager.generate_rag_response(
             query=request.query,
             top_k=request.top_k,
@@ -772,7 +840,7 @@ async def test_rag_query_no_auth(request: RAGRequest):
             custom_system_prompt=request.custom_system_prompt,
             include_search_details=request.include_search_details,
             conversation_history=[],  # No history for test
-            session_id=request.session_id
+            **test_kwargs
         )
         
         # Extract only the fields needed for the new RAGResponse format
@@ -825,6 +893,11 @@ async def rag_query(
                 logger.warning(f"Failed to retrieve conversation history: {history_error}")
                 # Continue without history if retrieval fails
         
+        # Prepare kwargs for session_id
+        rag_kwargs = {}
+        if request.session_id:
+            rag_kwargs["session_id"] = request.session_id
+        
         response = rag_manager.generate_rag_response(
             query=request.query,
             top_k=request.top_k,
@@ -833,7 +906,7 @@ async def rag_query(
             custom_system_prompt=request.custom_system_prompt,
             include_search_details=request.include_search_details,
             conversation_history=conversation_history,
-            session_id=request.session_id  # Pass session_id through
+            **rag_kwargs
         )
         
         # Add user info to metadata
@@ -932,6 +1005,11 @@ async def rag_stream(
                 # Continue without history if retrieval fails
         
         try:
+            # Prepare kwargs for session_id
+            stream_kwargs = {}
+            if request.session_id:
+                stream_kwargs["session_id"] = request.session_id
+            
             for chunk in rag_manager.generate_streaming_rag_response(
                 query=request.query,
                 top_k=request.top_k,
@@ -939,7 +1017,7 @@ async def rag_stream(
                 max_tokens=request.max_tokens,
                 custom_system_prompt=request.custom_system_prompt,
                 conversation_history=conversation_history,
-                session_id=request.session_id  # Pass session_id through
+                **stream_kwargs
             ):
                 # Add user info to metadata
                 if "rag_metadata" in chunk:
@@ -1522,12 +1600,26 @@ async def get_citation(filename: str):
         
         # URL decode the filename in case it has special characters
         filename = urllib.parse.unquote(filename)
+        logger.info(f"Citation request - Original filename: {filename}")
+        
+        # Remove square brackets if present (frontend sends [filename] format)
+        # Handle cases where only opening bracket is present (common frontend issue)
+        if filename.startswith('['):
+            if filename.endswith(']'):
+                filename = filename[1:-1]
+                logger.info(f"Citation request - Removed both brackets: {filename}")
+            else:
+                filename = filename[1:]  # Remove only opening bracket
+                logger.info(f"Citation request - Removed opening bracket only: {filename}")
+        else:
+            logger.info(f"Citation request - No brackets to remove: {filename}")
         
         # Create blob service client
         blob_service_client = BlobServiceClient.from_connection_string(connection_string)
         
         # Construct blob name (assuming documents are in md_files folder)
         blob_name = f"md_files/{filename}"
+        logger.info(f"Citation request - Constructed blob name: {blob_name}")
         
         # Get blob client for direct access
         blob_client = blob_service_client.get_blob_client(
@@ -1558,6 +1650,69 @@ async def get_citation(filename: str):
         raise HTTPException(status_code=500, detail=f"Failed to generate citation URL: {str(e)}")
 
 # Add debug endpoint to save answer to file
+@app.post("/title-summarizer", response_model=TitleSummarizerResponse)
+async def title_summarizer(
+    request: TitleSummarizerRequest,
+    current_user: UserInfo = Depends(get_current_user)
+):
+    """
+    Summarize text into a concise title with configurable word limit.
+    
+    Args:
+        request: Contains text to summarize and optional max_words limit
+        
+    Returns:
+        Summary with word count and original text
+    """
+    if not llm_manager:
+        raise HTTPException(status_code=503, detail="LLM Manager not available")
+    
+    try:
+        # Get configuration from environment variables
+        default_max_words = int(os.getenv("TITLE_SUMMARIZER_MAX_WORDS", "4"))
+        summarizer_prompt = os.getenv("TITLE_SUMMARIZER_PROMPT", 
+            "Summarize the following text into a concise title with exactly {max_words} words. Return only the title, no additional text or formatting:\n\n{text}")
+        
+        # Use request max_words if provided, otherwise use default
+        max_words = request.max_words if request.max_words is not None else default_max_words
+        
+        # Format the prompt with the text and word limit
+        formatted_prompt = summarizer_prompt.format(text=request.text, max_words=max_words)
+        
+        # Debug: Log the formatted prompt
+        logger.info(f"Title summarizer prompt: {formatted_prompt}")
+        
+        # Generate summary using LLM
+        response = llm_manager.generate_response(
+            query=formatted_prompt,
+            temperature=0.3,  # Lower temperature for more consistent summaries
+            max_tokens=50     # Limit tokens since we want short summaries
+        )
+        
+        summary = response.get("response", "").strip()
+        
+        # Count words in the summary
+        word_count = len(summary.split())
+        
+        logger.info(f"Title summarizer by {current_user.email}: {word_count} words generated for text of length {len(request.text)}")
+        
+        return TitleSummarizerResponse(
+            success=True,
+            summary=summary,
+            word_count=word_count,
+            original_text=request.text
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in title summarizer: {e}")
+        return TitleSummarizerResponse(
+            success=False,
+            summary="",
+            word_count=0,
+            original_text=request.text,
+            error=str(e)
+        )
+
 @app.get("/debug/save-answer")
 async def debug_save_answer():
     """Debug endpoint to collect chunks and save final answer to answer.txt"""
@@ -1599,6 +1754,292 @@ async def debug_save_answer():
             "error": str(e),
             "error_type": type(e).__name__
         }
+
+# Graph Analysis Endpoints
+@app.post("/graph/analyze")
+async def analyze_file_graph(
+    request: GraphRequest,
+    current_user: UserInfo = Depends(get_current_user)
+):
+    """
+    Analyze file relationships and create graph data.
+    
+    Args:
+        request: Graph analysis parameters
+        
+    Returns:
+        Graph data with nodes and edges
+    """
+    if not file_graph_manager:
+        raise HTTPException(status_code=503, detail="File Graph Manager not available")
+    
+    try:
+        graph_data = file_graph_manager.create_graph_data(
+            include_similarities=request.include_similarities,
+            include_dependencies=request.include_dependencies,
+            similarity_threshold=request.similarity_threshold
+        )
+        
+        return {
+            "success": True,
+            "graph_data": graph_data,
+            "requested_params": request.dict()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error analyzing file graph: {e}")
+        raise HTTPException(status_code=500, detail=f"Graph analysis failed: {str(e)}")
+
+@app.get("/graph/statistics")
+async def get_graph_statistics(current_user: UserInfo = Depends(get_current_user)):
+    """
+    Get statistics about the file graph.
+    
+    Returns:
+        Graph statistics and metrics
+    """
+    if not file_graph_manager:
+        raise HTTPException(status_code=503, detail="File Graph Manager not available")
+    
+    try:
+        stats = file_graph_manager.get_graph_statistics()
+        return {
+            "success": True,
+            "statistics": stats
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting graph statistics: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get graph statistics: {str(e)}")
+
+@app.post("/graph/similarities")
+async def analyze_file_similarities(
+    similarity_threshold: float = 0.7,
+    current_user: UserInfo = Depends(get_current_user)
+):
+    """
+    Analyze similarities between files.
+    
+    Args:
+        similarity_threshold: Minimum similarity threshold
+        
+    Returns:
+        File similarity analysis results
+    """
+    if not file_graph_manager:
+        raise HTTPException(status_code=503, detail="File Graph Manager not available")
+    
+    try:
+        similarities = file_graph_manager.analyze_file_similarities(similarity_threshold)
+        return {
+            "success": True,
+            "similarities": similarities
+        }
+        
+    except Exception as e:
+        logger.error(f"Error analyzing file similarities: {e}")
+        raise HTTPException(status_code=500, detail=f"Similarity analysis failed: {str(e)}")
+
+@app.post("/graph/dependencies")
+async def analyze_file_dependencies(current_user: UserInfo = Depends(get_current_user)):
+    """
+    Analyze dependencies between files.
+    
+    Returns:
+        File dependency analysis results
+    """
+    if not file_graph_manager:
+        raise HTTPException(status_code=503, detail="File Graph Manager not available")
+    
+    try:
+        dependencies = file_graph_manager.analyze_file_dependencies()
+        return {
+            "success": True,
+            "dependencies": dependencies
+        }
+        
+    except Exception as e:
+        logger.error(f"Error analyzing file dependencies: {e}")
+        raise HTTPException(status_code=500, detail=f"Dependency analysis failed: {str(e)}")
+
+@app.post("/graph/relationships")
+async def get_file_relationships(
+    request: FileRelationshipsRequest,
+    current_user: UserInfo = Depends(get_current_user)
+):
+    """
+    Get relationships for a specific file.
+    
+    Args:
+        request: File relationships request
+        
+    Returns:
+        File relationships analysis
+    """
+    if not file_graph_manager:
+        raise HTTPException(status_code=503, detail="File Graph Manager not available")
+    
+    try:
+        relationships = file_graph_manager.get_file_relationships(
+            request.filename,
+            request.max_relationships
+        )
+        return {
+            "success": True,
+            "relationships": relationships
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting file relationships: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get file relationships: {str(e)}")
+
+@app.post("/graph/visualize")
+async def create_graph_visualization(
+    request: GraphRequest,
+    current_user: UserInfo = Depends(get_current_user)
+):
+    """
+    Create an interactive graph visualization.
+    
+    Args:
+        request: Graph visualization parameters
+        
+    Returns:
+        Graph visualization data
+    """
+    if not file_graph_manager or not graph_visualizer:
+        raise HTTPException(status_code=503, detail="Graph visualization not available")
+    
+    try:
+        # Get graph data
+        graph_data = file_graph_manager.create_graph_data(
+            include_similarities=request.include_similarities,
+            include_dependencies=request.include_dependencies,
+            similarity_threshold=request.similarity_threshold
+        )
+        
+        # Create network graph
+        network_fig = graph_visualizer.create_network_graph(
+            graph_data,
+            layout=request.layout,
+            node_size_factor=request.node_size_factor,
+            edge_threshold=request.edge_threshold
+        )
+        
+        # Create additional visualizations
+        heatmap_fig = graph_visualizer.create_similarity_heatmap(graph_data)
+        stats_fig = graph_visualizer.create_statistics_dashboard(graph_data)
+        
+        return {
+            "success": True,
+            "network_graph": network_fig.to_json() if network_fig else None,
+            "similarity_heatmap": heatmap_fig.to_json() if heatmap_fig else None,
+            "statistics_dashboard": stats_fig.to_json() if stats_fig else None,
+            "graph_metadata": graph_data.get('metadata', {})
+        }
+        
+    except Exception as e:
+        logger.error(f"Error creating graph visualization: {e}")
+        raise HTTPException(status_code=500, detail=f"Visualization creation failed: {str(e)}")
+
+@app.post("/graph/export")
+async def export_graph_visualization(
+    request: GraphRequest,
+    current_user: UserInfo = Depends(get_current_user)
+):
+    """
+    Export graph visualization as HTML file.
+    
+    Args:
+        request: Graph export parameters
+        
+    Returns:
+        Export status and file information
+    """
+    if not file_graph_manager or not graph_visualizer:
+        raise HTTPException(status_code=503, detail="Graph visualization not available")
+    
+    try:
+        # Get graph data
+        graph_data = file_graph_manager.create_graph_data(
+            include_similarities=request.include_similarities,
+            include_dependencies=request.include_dependencies,
+            similarity_threshold=request.similarity_threshold
+        )
+        
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"file_graph_{timestamp}.html"
+        
+        # Export to HTML
+        success = graph_visualizer.export_graph_as_html(
+            graph_data,
+            output_path=filename,
+            include_all_charts=True
+        )
+        
+        if success:
+            return {
+                "success": True,
+                "message": "Graph exported successfully",
+                "filename": filename,
+                "download_url": f"/graph/download/{filename}"
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to export graph")
+        
+    except Exception as e:
+        logger.error(f"Error exporting graph: {e}")
+        raise HTTPException(status_code=500, detail=f"Graph export failed: {str(e)}")
+
+@app.get("/graph/download/{filename}")
+async def download_graph_file(filename: str, current_user: UserInfo = Depends(get_current_user)):
+    """
+    Download exported graph file.
+    
+    Args:
+        filename: Name of the file to download
+        
+    Returns:
+        File download response
+    """
+    try:
+        file_path = Path(filename)
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        from fastapi.responses import FileResponse
+        return FileResponse(
+            path=file_path,
+            filename=filename,
+            media_type='text/html'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error downloading graph file: {e}")
+        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+
+@app.post("/graph/clear-cache")
+async def clear_graph_cache(current_user: UserInfo = Depends(get_current_user)):
+    """
+    Clear graph analysis cache.
+    
+    Returns:
+        Cache clearing status
+    """
+    if not file_graph_manager:
+        raise HTTPException(status_code=503, detail="File Graph Manager not available")
+    
+    try:
+        file_graph_manager.clear_cache()
+        return {
+            "success": True,
+            "message": "Graph cache cleared successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error clearing graph cache: {e}")
+        raise HTTPException(status_code=500, detail=f"Cache clearing failed: {str(e)}")
 
 if __name__ == "__main__":
     # Development server configuration

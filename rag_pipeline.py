@@ -92,7 +92,7 @@ def main():
             llm_manager=llm_manager,
             default_top_k=3,  # Reduced from 5 based on debug results
             max_context_tokens=6000,  # Increased from 3000 to handle larger documents
-            relevance_threshold=0.02  # Added slight threshold for better quality
+            relevance_threshold=0.005  # Updated to 0.005 for better search results
         )
         
         print("   ✅ All components initialized successfully!")
@@ -330,7 +330,7 @@ Context:
             print(f"     Threshold {threshold:.3f}: {docs_found} documents")
         
         # Reset to optimal threshold
-        rag_manager.relevance_threshold = 0.02
+        rag_manager.relevance_threshold = 0.005
         
         # Test different top_k values
         print(f"   Testing different top_k values...")
@@ -363,7 +363,7 @@ Context:
             "🎯 Use specific queries for better retrieval results",
             "📊 Start with top_k=3, increase if you need more context", 
             "🔧 Set max_context_tokens=6000+ for documents with large chunks",
-            "🎚️  Use relevance_threshold=0.02-0.05 for better quality",
+            "🎚️  Use relevance_threshold=0.005-0.05 for better quality",
             "🌡️  Lower temperature (0.3-0.5) for factual responses",
             "🌡️  Higher temperature (0.7-0.9) for creative responses",
             "📝 Use custom system prompts for domain-specific formatting",
@@ -396,7 +396,7 @@ Context:
         print(f"   📚 Ready for integration into your applications")
         print(f"   🔗 Use rag_manager.generate_rag_response() for non-streaming")
         print(f"   🌊 Use rag_manager.generate_streaming_rag_response() for streaming")
-        print(f"   🎯 Optimized settings: top_k=3, max_tokens=6000, threshold=0.02")
+        print(f"   🎯 Optimized settings: top_k=3, max_tokens=6000, threshold=0.005")
         
     except Exception as e:
         print(f"❌ Demo error: {e}")

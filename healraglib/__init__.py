@@ -16,6 +16,8 @@ from .search_index_manager import SearchIndexManager
 from .llm_manager import LLMManager
 from .rag_manager import RAGManager
 from .cosmo_db_manager import CosmoDBManager
+from .file_graph_manager import FileGraphManager
+from .graph_visualizer import GraphVisualizer
 
 # Convenience imports
 __all__ = [
@@ -24,7 +26,9 @@ __all__ = [
     "SearchIndexManager",
     "LLMManager",
     "RAGManager",
-    "CosmoDBManager"
+    "CosmoDBManager",
+    "FileGraphManager",
+    "GraphVisualizer"
 ]
 
 def get_version():

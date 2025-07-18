@@ -110,7 +110,7 @@ curl -s http://localhost:8000/config | python -m json.tool
         "default_top_k": 3,
         "max_context_tokens": 6000,
         "include_source_info": true,
-        "relevance_threshold": 0.02
+        "relevance_threshold": 0.005
     }
 }
 ```

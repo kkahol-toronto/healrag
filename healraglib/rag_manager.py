@@ -28,7 +28,8 @@ class RAGManager:
                  default_top_k: int = 5,
                  max_context_tokens: int = 3000,
                  include_source_info: bool = True,
-                 relevance_threshold: float = 0.0):
+                 relevance_threshold: float = 0.0,
+                 default_system_prompt: Optional[str] = None):
         """
         Initialize the RAG Manager.
         
@@ -46,6 +47,7 @@ class RAGManager:
         self.max_context_tokens = max_context_tokens
         self.include_source_info = include_source_info
         self.relevance_threshold = relevance_threshold
+        self.default_system_prompt = default_system_prompt
         self.logger = logging.getLogger(__name__)
         
         # Validate dependencies
@@ -187,10 +189,12 @@ class RAGManager:
             # Prepare sources array in the format frontend expects
             formatted_sources = []
             for source in sources:
+                source_file = source.get("source_file", "Unknown")
+                # Use the full filename for both title and source to match frontend expectations
                 formatted_source = {
-                    "title": Path(source.get("source_file", "Unknown")).stem,  # Document title without extension
+                    "title": Path(source_file).name,  # Full filename with extension
                     "content": source.get("content", ""),
-                    "source": Path(source.get("source_file", "Unknown")).name,  # Filename with extension for citations
+                    "source": Path(source_file).name,  # Full filename with extension for citations
                     "chunk_id": source.get("document_id", ""),
                     "score": round(source.get("score", 0), 3)
                 }
@@ -468,6 +472,16 @@ class RAGManager:
             # Estimate tokens for this document
             doc_tokens = self.llm_manager.estimate_tokens(content)
             
+            # If document is too large, truncate it to fit within token limit
+            if doc_tokens > self.max_context_tokens:
+                # Calculate how much content we can fit
+                # Use a rough estimate: 1 token ≈ 4 characters
+                max_chars = int(self.max_context_tokens * 4 * 0.8)  # 80% of limit to be safe
+                if len(content) > max_chars:
+                    content = content[:max_chars] + "... [Content truncated due to size]"
+                    doc_tokens = self.llm_manager.estimate_tokens(content)
+                    self.logger.info(f"Truncated document {i+1} from {doc.get('chunk_size', 0)} to {len(content)} characters")
+            
             # Check if adding this document would exceed token limit
             if current_tokens + doc_tokens > self.max_context_tokens:
                 self.logger.info(f"Context token limit reached. Using {i} of {len(retrieved_docs)} documents")
@@ -512,16 +526,19 @@ class RAGManager:
                 history_section += f"User: {query}\n"
                 history_section += f"Assistant: {response}\n\n"
         
-        if custom_prompt:
+        # Use custom prompt if provided, otherwise use default system prompt
+        prompt_to_use = custom_prompt or self.default_system_prompt
+        
+        if prompt_to_use:
             # Use custom prompt template - should include {context} and optionally {history} placeholders
             try:
-                if "{history}" in custom_prompt:
-                    return custom_prompt.format(context=context, history=history_section)
+                if "{history}" in prompt_to_use:
+                    return prompt_to_use.format(context=context, history=history_section)
                 else:
-                    return custom_prompt.format(context=context) + history_section
+                    return prompt_to_use.format(context=context) + history_section
             except KeyError:
                 self.logger.warning("Custom prompt missing {context} placeholder, appending context and history")
-                return f"{custom_prompt}\n\nRelevant Context:\n{context}{history_section}"
+                return f"{prompt_to_use}\n\nRelevant Context:\n{context}{history_section}"
         
         # Default RAG system message with conversation history
         if "No relevant documents found" in context:

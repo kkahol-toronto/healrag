@@ -203,7 +203,7 @@ async def initialize_components():
                 llm_manager=llm_manager,
                 default_top_k=3,
                 max_context_tokens=6000,
-                relevance_threshold=0.02
+                relevance_threshold=0.005
             )
             logger.info("RAG Manager initialized")
         

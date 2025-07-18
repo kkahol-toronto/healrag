@@ -53,7 +53,7 @@ def test_search():
         
         # Test 1: Text search (like Azure portal)
         print(f"\n🔍 Test 1: Text Search")
-        query = "cyber security policy"
+        query = "face recognition"
         print(f"   Query: '{query}'")
         
         try:
