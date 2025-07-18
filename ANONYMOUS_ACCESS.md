@@ -23,7 +23,12 @@ The NTTCodeGenerator application now supports **anonymous access** for basic fea
    - Get anonymous user information
    - Useful for testing
 
-4. **Anonymous Test** (`/anonymous/test`)
+4. **Title Summarizer** (`/title-summarizer/anonymous`)
+   - Generate concise titles from text
+   - Limited to 3 words maximum
+   - No custom prompts
+
+5. **Anonymous Test** (`/anonymous/test`)
    - Test endpoint to verify anonymous access
    - Shows available features and limitations
 
@@ -141,6 +146,35 @@ curl -X POST https://nttcodegenerator.azurewebsites.net/search/documents/anonymo
 }
 ```
 
+### 4. Title Summarization (Anonymous)
+
+```bash
+# Generate a title from text without authentication
+curl -X POST https://nttcodegenerator.azurewebsites.net/title-summarizer/anonymous \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "This is a comprehensive guide about cybersecurity policies and procedures",
+    "max_words": 3
+  }'
+```
+
+**Example Response:**
+```json
+{
+    "success": true,
+    "summary": "Cybersecurity Policy Guide",
+    "word_count": 3,
+    "original_text": "This is a comprehensive guide about cybersecurity policies and procedures",
+    "error": null,
+    "user_info": {
+        "user_id": "anonymous",
+        "email": "anonymous@example.com",
+        "name": "Anonymous User",
+        "is_anonymous": true
+    }
+}
+```
+
 ## 📋 Limitations for Anonymous Users
 
 ### RAG Queries
@@ -152,6 +186,10 @@ curl -X POST https://nttcodegenerator.azurewebsites.net/search/documents/anonymo
 ### Document Search
 - **Max Results**: 3 (vs 5 for authenticated users)
 - **Advanced Features**: Limited
+
+### Title Summarization
+- **Max Words**: 3 (vs 20 for authenticated users)
+- **Custom Prompts**: No (uses default prompt only)
 
 ### General Limitations
 - **No Session History**: Anonymous users can't access chat history

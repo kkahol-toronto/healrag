@@ -29,6 +29,16 @@ The API will be available at:
 
 ## 📚 API Endpoints Documentation
 
+HEALRAG provides a comprehensive REST API with the following endpoint categories:
+
+- **Health & Configuration**: System health checks and configuration management
+- **Training Pipeline**: Document processing and search index management
+- **RAG Query**: AI-powered question answering with document context
+- **Search**: Vector-based document search functionality
+- **Utility**: Helper endpoints like title summarization
+- **Authentication**: Azure AD OAuth2 authentication
+- **Session Management**: Chat history and conversation management
+
 ### Health & Configuration Endpoints
 
 #### 🟢 GET `/health` - Comprehensive Health Check
@@ -321,6 +331,60 @@ data: {"type": "chunk", "content": " security practice..."}
 data: {"type": "sources", "sources": [{"source_file": "data_classification.pdf", "relevance_score": 0.92}]}
 data: {"type": "end", "metadata": {"total_tokens": 1200}}
 ```
+
+### Utility Endpoints
+
+#### 📝 POST `/title-summarizer` - Text Title Summarization
+Generate concise titles from text with configurable word limits. This endpoint uses AI to create meaningful, contextually appropriate titles.
+
+**Parameters:**
+- `text` (required): The text to summarize into a title
+- `max_words` (optional): Maximum number of words for the title (default: 4, range: 1-20)
+
+**curl command (default 4 words):**
+```bash
+curl -X POST "http://localhost:8000/title-summarizer" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -d '{
+    "text": "This is a comprehensive guide about cybersecurity policies and procedures that organizations should follow to protect their digital assets and maintain compliance with industry standards."
+  }'
+```
+
+**curl command (custom word limit):**
+```bash
+curl -X POST "http://localhost:8000/title-summarizer" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -d '{
+    "text": "This is a comprehensive guide about cybersecurity policies and procedures that organizations should follow to protect their digital assets and maintain compliance with industry standards.",
+    "max_words": 6
+  }'
+```
+
+**Expected Response:**
+```json
+{
+    "success": true,
+    "summary": "Cybersecurity Policies Compliance Guide",
+    "word_count": 4,
+    "original_text": "This is a comprehensive guide about cybersecurity policies and procedures that organizations should follow to protect their digital assets and maintain compliance with industry standards.",
+    "error": null
+}
+```
+
+**Configuration:**
+The endpoint reads from environment variables:
+- `TITLE_SUMMARIZER_MAX_WORDS=4` (default word limit)
+- `TITLE_SUMMARIZER_PROMPT=...` (customizable AI prompt)
+
+**Example Use Cases:**
+- Generate document titles from content
+- Create section headers from paragraphs
+- Summarize user queries into search-friendly titles
+- Generate meeting agenda item titles
+
+📖 **For detailed API documentation, see [TITLE_SUMMARIZER_API.md](TITLE_SUMMARIZER_API.md)**
 
 ### Search Endpoints
 
@@ -1189,6 +1253,10 @@ export AZURE_SEARCH_INDEX_NAME="healrag-index"
 # Optional: Search index configuration
 export CHUNK_SIZE="1000"
 export CHUNK_OVERLAP="200"
+
+# Optional: Title Summarizer configuration
+export TITLE_SUMMARIZER_MAX_WORDS="4"
+export TITLE_SUMMARIZER_PROMPT="You are a title generator. Summarize the following text into exactly {max_words} words. Respond with ONLY the title, no explanations or additional text. Text to summarize: {text}"
 
 
 ```
